@@ -1,0 +1,15 @@
+[project]
+name = "wowaddons"
+version = "1.0.0"
+description = "Lightweight WoW Addon Package Manager (CurseForge)"
+requires-python = ">=3.8"
+
+[project.scripts]
+wowaddons = "wowaddons:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["wowaddons"]
