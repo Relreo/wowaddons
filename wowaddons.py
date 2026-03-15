@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""wowaddons - Lightweight WoW Addon Package Manager
+"""Lightweight WoW Addon Package Manager.
 
 A stateless, pip-like CLI for managing World of Warcraft addons via CurseForge.
 Zero external dependencies. Zero stored state. Run from your WoW AddOns folder.
 
-All addon metadata is read from .toc files at runtime. The API key comes from
-the CURSEFORGE_API_KEY environment variable (or the --key flag). The game
-flavor is auto-detected from the directory path.
+All addon metadata is read from ``.toc`` files at runtime. The API key comes
+from the ``CURSEFORGE_API_KEY`` environment variable (or the ``--key`` flag).
+The game flavor is auto-detected from the directory path.
 
-Usage:
+Usage::
+
     wowaddons update
     wowaddons install deadly-boss-mods details
     wowaddons list
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -25,27 +28,52 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, TypedDict
 
 __version__ = "1.1.0"
 
-CF_API = "https://api.curseforge.com"
-WOW_GAME_ID = 1
-ADDON_CLASS_ID = 6
+CF_API: str = "https://api.curseforge.com"
+WOW_GAME_ID: int = 1
+ADDON_CLASS_ID: int = 6
 
-FLAVORS = {
+FLAVORS: dict[str, int] = {
     "retail": 517,
     "classic": 67408,
     "classic_era": 73713,
 }
 
-log = logging.getLogger("wowaddons")
+log: logging.Logger = logging.getLogger("wowaddons")
+
+
+class ProjectData(TypedDict):
+    """Metadata for a locally installed CurseForge addon project."""
+
+    folders: list[str]
+    title: str
+    version: str
+
+
+class UnmatchedAddon(TypedDict):
+    """Metadata for a local addon folder without a CurseForge project ID."""
+
+    folder: str
+    title: str
+    version: str
 
 
 class _LogFormatter(logging.Formatter):
-    """Clean output at INFO, labeled at other levels."""
-    def format(self, record):
+    """Log formatter producing clean output at INFO, labeled at other levels."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format a log record with level-appropriate prefixes.
+
+        Args:
+            record: The log record to format.
+
+        Returns:
+            The formatted log message string.
+        """
         msg = record.getMessage()
         if record.levelno == logging.DEBUG:
             return f"  [DEBUG] {msg}"
@@ -60,7 +88,16 @@ class _LogFormatter(logging.Formatter):
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _fmt_size(n):
+
+def _fmt_size(n: float) -> str:
+    """Format a byte count into a human-readable size string.
+
+    Args:
+        n: The number of bytes.
+
+    Returns:
+        A formatted string such as ``"1.5 MB"`` or ``"32.0 KB"``.
+    """
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -68,7 +105,15 @@ def _fmt_size(n):
     return f"{n:.1f} TB"
 
 
-def _fmt_count(n):
+def _fmt_count(n: float) -> str:
+    """Format a large number with K/M suffixes for compact display.
+
+    Args:
+        n: The number to format.
+
+    Returns:
+        A compact string such as ``"1.5M"`` or ``"32.1K"``.
+    """
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
@@ -76,14 +121,31 @@ def _fmt_count(n):
     return str(int(n))
 
 
-def _truncate(text, length=70):
+def _truncate(text: str | None, length: int = 70) -> str:
+    """Truncate a string with an ellipsis if it exceeds the given length.
+
+    Args:
+        text: The string to truncate, or ``None``.
+        length: Maximum allowed length before truncation.
+
+    Returns:
+        The original string, a truncated version ending in ``"..."``, or
+        an empty string if ``text`` is falsy.
+    """
     if not text:
         return ""
     return (text[:length] + "...") if len(text) > length else text
 
 
-def _normalize(s):
-    """Strip non-alphanumeric chars and lowercase for fuzzy comparison."""
+def _normalize(s: str) -> str:
+    """Strip non-alphanumeric characters and lowercase for fuzzy comparison.
+
+    Args:
+        s: The string to normalize.
+
+    Returns:
+        A lowercase, alphanumeric-only version of ``s``.
+    """
     return "".join(c.lower() for c in s if c.isalnum())
 
 
@@ -91,9 +153,18 @@ def _normalize(s):
 # .toc parsing & addon detection
 # ---------------------------------------------------------------------------
 
-def _parse_toc(toc_path):
-    """Parse a WoW .toc file and return a dict of its ## metadata fields."""
-    meta = {}
+
+def _parse_toc(toc_path: Path | str) -> dict[str, str]:
+    """Parse a WoW ``.toc`` file and return its ``##`` metadata fields.
+
+    Args:
+        toc_path: Path to the ``.toc`` file.
+
+    Returns:
+        A dict mapping field names to their values
+        (e.g. ``{"Title": "Details", "Version": "1.2.3"}``).
+    """
+    meta: dict[str, str] = {}
     try:
         with open(toc_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -107,15 +178,20 @@ def _parse_toc(toc_path):
     return meta
 
 
-def _scan_addons():
-    """Scan cwd for addon folders, reading .toc metadata.
+def _scan_addons() -> tuple[dict[int, ProjectData], list[UnmatchedAddon]]:
+    """Scan the current directory for addon folders, reading ``.toc`` metadata.
 
-    Returns (by_project, unmatched):
-      by_project = {project_id: {"folders": [...], "title": str, "version": str}}
-      unmatched  = [{"folder": str, "title": str, "version": str}]
+    Addon folders starting with ``Blizzard_`` or ``.`` are skipped. Folders
+    whose ``.toc`` contains an ``X-Curse-Project-ID`` are grouped by project;
+    the rest are returned as unmatched.
+
+    Returns:
+        A tuple of ``(by_project, unmatched)`` where ``by_project`` maps
+        CurseForge project IDs to :class:`ProjectData` and ``unmatched``
+        is a list of :class:`UnmatchedAddon` dicts.
     """
-    by_project = {}
-    unmatched = []
+    by_project: dict[int, ProjectData] = {}
+    unmatched: list[UnmatchedAddon] = []
 
     for entry in sorted(Path.cwd().iterdir()):
         if not entry.is_dir():
@@ -127,30 +203,35 @@ def _scan_addons():
         if not toc_files:
             continue
 
-        toc = next((t for t in toc_files if t.stem == entry.name), toc_files[0])
+        toc = next(
+            (t for t in toc_files if t.stem == entry.name), toc_files[0]
+        )
         meta = _parse_toc(toc)
         title = meta.get("Title", entry.name)
         version = meta.get("Version", "")
         pid_str = meta.get("X-Curse-Project-ID", "")
 
-        log.debug(f"{entry.name}: title={title!r}  version={version!r}  project_id={pid_str!r}")
+        log.debug(
+            f"{entry.name}: title={title!r}  version={version!r}  "
+            f"project_id={pid_str!r}"
+        )
 
         if pid_str and pid_str.isdigit():
             pid = int(pid_str)
             if pid in by_project:
                 by_project[pid]["folders"].append(entry.name)
             else:
-                by_project[pid] = {
-                    "folders": [entry.name],
-                    "title": title,
-                    "version": version,
-                }
+                by_project[pid] = ProjectData(
+                    folders=[entry.name],
+                    title=title,
+                    version=version,
+                )
         else:
-            unmatched.append({
-                "folder": entry.name,
-                "title": title,
-                "version": version,
-            })
+            unmatched.append(UnmatchedAddon(
+                folder=entry.name,
+                title=title,
+                version=version,
+            ))
 
     return by_project, unmatched
 
@@ -159,13 +240,28 @@ def _scan_addons():
 # Flavor auto-detection
 # ---------------------------------------------------------------------------
 
-def _detect_flavor(override=None):
-    """Auto-detect game flavor from directory path, or use override."""
+
+def _detect_flavor(override: str | None = None) -> str:
+    """Auto-detect the WoW game flavor from the directory path.
+
+    Inspects the components of the current working directory for
+    ``_classic_era_``, ``_classic_``, or defaults to ``retail``.
+
+    Args:
+        override: If provided, use this flavor instead of auto-detecting.
+
+    Returns:
+        One of ``"retail"``, ``"classic"``, or ``"classic_era"``.
+    """
     if override:
         if override not in FLAVORS:
-            log.error(f"Unknown flavor '{override}'. Choose from: {', '.join(FLAVORS)}")
+            log.error(
+                f"Unknown flavor '{override}'. "
+                f"Choose from: {', '.join(FLAVORS)}"
+            )
             sys.exit(1)
         return override
+
     lower_parts = [p.lower() for p in Path.cwd().parts]
     if "_classic_era_" in lower_parts:
         flavor = "classic_era"
@@ -181,16 +277,43 @@ def _detect_flavor(override=None):
 # CurseForge API helpers
 # ---------------------------------------------------------------------------
 
-def _api_key(args):
-    key = getattr(args, "key", None) or os.environ.get("CURSEFORGE_API_KEY", "")
+
+def _api_key(args: argparse.Namespace) -> str:
+    """Retrieve the CurseForge API key from args or the environment.
+
+    Args:
+        args: Parsed CLI arguments (may contain a ``key`` attribute).
+
+    Returns:
+        The API key string.
+    """
+    key = getattr(args, "key", None) or os.environ.get(
+        "CURSEFORGE_API_KEY", ""
+    )
     if not key:
-        log.error("No API key configured. Run 'wowaddons init' to set one up.")
+        log.error(
+            "No API key configured. Run 'wowaddons init' to set one up."
+        )
         sys.exit(1)
     log.debug("API key loaded")
     return key
 
 
-def _api(endpoint, key, params=None):
+def _api(
+    endpoint: str,
+    key: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Make a GET request to the CurseForge API.
+
+    Args:
+        endpoint: API path (e.g. ``"/v1/mods/search"``).
+        key: CurseForge API key.
+        params: Optional query-string parameters.
+
+    Returns:
+        The parsed JSON response as a dict, or ``None`` on failure.
+    """
     url = f"{CF_API}{endpoint}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -213,15 +336,31 @@ def _api(endpoint, key, params=None):
         if exc.code == 404:
             log.warning(f"Not found on CurseForge: {endpoint}")
         else:
-            log.warning(f"CurseForge API returned HTTP {exc.code} for {endpoint}")
+            log.warning(
+                f"CurseForge API returned HTTP {exc.code} for {endpoint}"
+            )
         return None
     except urllib.error.URLError as exc:
         log.warning(f"Network request failed - {exc.reason}")
         return None
 
 
-def _search(key, query, flavor_id=None):
-    params = {
+def _search(
+    key: str,
+    query: str,
+    flavor_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Search CurseForge for WoW addons matching a query.
+
+    Args:
+        key: CurseForge API key.
+        query: Free-text search string.
+        flavor_id: Optional game-version type ID to filter by flavor.
+
+    Returns:
+        A list of addon dicts from the API, possibly empty.
+    """
+    params: dict[str, Any] = {
         "gameId": WOW_GAME_ID,
         "classId": ADDON_CLASS_ID,
         "searchFilter": query,
@@ -237,15 +376,38 @@ def _search(key, query, flavor_id=None):
     return data
 
 
-def _get_mod(key, mod_id):
+def _get_mod(key: str, mod_id: int) -> dict[str, Any] | None:
+    """Fetch a single mod by its CurseForge ID.
+
+    Args:
+        key: CurseForge API key.
+        mod_id: The CurseForge project ID.
+
+    Returns:
+        The mod data dict, or ``None`` if not found.
+    """
     log.debug(f"Fetching mod {mod_id}")
     resp = _api(f"/v1/mods/{mod_id}", key)
     return resp.get("data") if resp else None
 
 
-def _get_files(key, mod_id, flavor_id=None):
+def _get_files(
+    key: str,
+    mod_id: int,
+    flavor_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch available files for a mod from CurseForge.
+
+    Args:
+        key: CurseForge API key.
+        mod_id: The CurseForge project ID.
+        flavor_id: Optional game-version type ID to filter by flavor.
+
+    Returns:
+        A list of file-info dicts, possibly empty.
+    """
     log.debug(f"Fetching files for mod {mod_id}")
-    params = {"pageSize": 20}
+    params: dict[str, Any] = {"pageSize": 20}
     if flavor_id:
         params["gameVersionTypeId"] = flavor_id
     resp = _api(f"/v1/mods/{mod_id}/files", key, params)
@@ -254,21 +416,46 @@ def _get_files(key, mod_id, flavor_id=None):
     return data
 
 
-def _pick_file(files):
-    """Return the latest release-quality file, falling back to any file."""
+def _pick_file(files: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select the best file from a list of CurseForge file entries.
+
+    Prefers ``releaseType == 1`` (stable). Falls back to the first file
+    in the list if no stable release is available.
+
+    Args:
+        files: File-info dicts from the CurseForge API.
+
+    Returns:
+        The chosen file dict, or ``None`` if ``files`` is empty.
+    """
     for f in files:
         if f.get("releaseType", 1) == 1:
-            log.debug(f"Selected release file: {f.get('displayName', f.get('fileName'))} (id={f['id']})")
+            log.debug(
+                f"Selected release file: "
+                f"{f.get('displayName', f.get('fileName'))} (id={f['id']})"
+            )
             return f
     if files:
         picked = files[0]
-        log.debug(f"No release found, falling back to: {picked.get('displayName')} (type={picked.get('releaseType')})")
+        log.debug(
+            f"No release found, falling back to: "
+            f"{picked.get('displayName')} (type={picked.get('releaseType')})"
+        )
         return picked
     return None
 
 
-def _download_url(file_info):
-    """Get a download URL, falling back to the CDN if the API field is null."""
+def _download_url(file_info: dict[str, Any]) -> str:
+    """Extract a download URL from a CurseForge file entry.
+
+    Falls back to a CDN URL if the API ``downloadUrl`` field is null.
+
+    Args:
+        file_info: A file-info dict from the CurseForge API.
+
+    Returns:
+        A direct download URL string.
+    """
     url = file_info.get("downloadUrl")
     if url:
         log.debug(f"Download URL: {url}")
@@ -280,13 +467,31 @@ def _download_url(file_info):
     return url
 
 
-def _resolve(key, identifier, flavor_id=None):
-    """Resolve a slug, name, or numeric ID to a CurseForge addon dict."""
+def _resolve(
+    key: str,
+    identifier: str,
+    flavor_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a slug, name, or numeric ID to a CurseForge addon dict.
+
+    Tries numeric-ID lookup first, then searches by text and matches on
+    exact slug, exact name, or falls back to the top search result.
+
+    Args:
+        key: CurseForge API key.
+        identifier: A slug, addon name, or numeric project ID string.
+        flavor_id: Optional game-version type ID to filter by flavor.
+
+    Returns:
+        The matched addon dict, or ``None`` if nothing was found.
+    """
     if identifier.isdigit():
         log.debug(f"Resolving '{identifier}' as numeric ID")
         mod = _get_mod(key, int(identifier))
         if mod:
-            log.debug(f"Resolved to: {mod['name']} (slug={mod['slug']})")
+            log.debug(
+                f"Resolved to: {mod['name']} (slug={mod['slug']})"
+            )
             return mod
 
     log.debug(f"Searching for '{identifier}'")
@@ -302,47 +507,84 @@ def _resolve(key, identifier, flavor_id=None):
             return r
 
     if results:
-        log.debug(f"No exact match, using top result: {results[0]['name']}")
+        log.debug(
+            f"No exact match, using top result: {results[0]['name']}"
+        )
         return results[0]
 
     log.debug(f"No results for '{identifier}'")
     return None
 
 
-def _search_by_slug(key, slug):
-    """Search CurseForge by exact slug match."""
-    params = {"gameId": WOW_GAME_ID, "slug": slug}
+def _search_by_slug(key: str, slug: str) -> dict[str, Any] | None:
+    """Search CurseForge for an addon matching an exact slug.
+
+    Args:
+        key: CurseForge API key.
+        slug: The addon slug to search for.
+
+    Returns:
+        The matched addon dict, or ``None`` if not found.
+    """
+    params: dict[str, Any] = {"gameId": WOW_GAME_ID, "slug": slug}
     resp = _api("/v1/mods/search", key, params)
     data = resp.get("data", []) if resp else []
     return data[0] if data else None
 
 
-def _match_folder(key, folder_name, title=None, flavor_id=None):
-    """Try to match a local addon to CurseForge by slug, then title search."""
+def _match_folder(
+    key: str,
+    folder_name: str,
+    title: str | None = None,
+    flavor_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Try to match a local addon folder to a CurseForge project.
+
+    Attempts slug lookup first, then falls back to text search by title
+    and folder name with normalized fuzzy matching.
+
+    Args:
+        key: CurseForge API key.
+        folder_name: The local addon folder name.
+        title: Optional title from the ``.toc`` file.
+        flavor_id: Optional game-version type ID to filter by flavor.
+
+    Returns:
+        The matched addon dict, or ``None`` if no match was found.
+    """
     norm_folder = _normalize(folder_name)
     norm_title = _normalize(title) if title else ""
 
-    # Try exact slug lookup first (most reliable)
     slug_guess = folder_name.lower()
     log.debug(f"Trying slug lookup: {slug_guess}")
     hit = _search_by_slug(key, slug_guess)
     if hit:
-        log.debug(f"Matched '{folder_name}' via slug -> {hit['name']} (id={hit['id']})")
+        log.debug(
+            f"Matched '{folder_name}' via slug -> "
+            f"{hit['name']} (id={hit['id']})"
+        )
         return hit
 
-    def _check(results):
+    def _check(
+        results: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
         for r in results:
             ns = _normalize(r.get("slug", ""))
             nn = _normalize(r.get("name", ""))
             if ns == norm_folder or nn == norm_folder:
-                log.debug(f"Matched '{folder_name}' -> {r['name']} (slug={r['slug']})")
+                log.debug(
+                    f"Matched '{folder_name}' -> "
+                    f"{r['name']} (slug={r['slug']})"
+                )
                 return r
             if norm_title and (ns == norm_title or nn == norm_title):
-                log.debug(f"Matched title '{title}' -> {r['name']} (slug={r['slug']})")
+                log.debug(
+                    f"Matched title '{title}' -> "
+                    f"{r['name']} (slug={r['slug']})"
+                )
                 return r
         return None
 
-    # Fall back to text search by title, then folder name
     if title:
         results = _search(key, title)
         hit = _check(results) if results else None
@@ -363,11 +605,21 @@ def _match_folder(key, folder_name, title=None, flavor_id=None):
 # Download & extraction
 # ---------------------------------------------------------------------------
 
-def _download_extract(url, dest):
-    """Download zip to temp dir, extract there, then move folders into *dest*.
 
-    Nothing touches the destination until the download and extraction are both
-    fully validated.  On failure the temp files are cleaned up automatically.
+def _download_extract(url: str, dest: str) -> list[str] | None:
+    """Download a zip archive and extract its contents to a destination.
+
+    Downloads to a temporary staging directory, validates the zip, then
+    atomically moves the top-level folders into ``dest``. Existing folders
+    at the destination are removed first. On failure the temp files are
+    cleaned up automatically.
+
+    Args:
+        url: Direct download URL for the addon zip archive.
+        dest: Destination directory to extract addon folders into.
+
+    Returns:
+        A list of extracted folder names, or ``None`` on failure.
     """
     staging = tempfile.mkdtemp(prefix="wowaddons_")
     log.debug(f"Created staging directory: {staging}")
@@ -375,7 +627,9 @@ def _download_extract(url, dest):
         zip_path = os.path.join(staging, "addon.zip")
 
         log.debug(f"Downloading: {url}")
-        req = urllib.request.Request(url, headers={"User-Agent": f"wowaddons/{__version__}"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"wowaddons/{__version__}"}
+        )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 with open(zip_path, "wb") as fp:
@@ -393,7 +647,9 @@ def _download_extract(url, dest):
             with zipfile.ZipFile(zip_path) as zf:
                 entries = zf.namelist()
                 log.debug(f"Zip contains {len(entries)} entries")
-                folders = sorted({n.split("/")[0] for n in entries if n.split("/")[0]})
+                folders = sorted(
+                    {n.split("/")[0] for n in entries if n.split("/")[0]}
+                )
                 if not folders:
                     log.error("Zip archive is empty.")
                     return None
@@ -423,8 +679,21 @@ def _download_extract(url, dest):
 # Version comparison
 # ---------------------------------------------------------------------------
 
-def _needs_update(local_version, cf_file):
-    """Return True if the local addon looks outdated vs the CurseForge file."""
+
+def _needs_update(local_version: str, cf_file: dict[str, Any]) -> bool:
+    """Determine whether a local addon is outdated vs. a CurseForge file.
+
+    Returns ``False`` when the local version string appears inside the
+    CurseForge file's ``displayName`` or ``fileName``, or when the local
+    version is empty or a template placeholder (starts with ``@``).
+
+    Args:
+        local_version: The version string from the local ``.toc`` file.
+        cf_file: A file-info dict from the CurseForge API.
+
+    Returns:
+        ``True`` if the addon appears to need an update.
+    """
     if not local_version or local_version.startswith("@"):
         return False
 
@@ -441,16 +710,27 @@ def _needs_update(local_version, cf_file):
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_init(args):
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Interactively configure the CurseForge API key.
+
+    On Windows the key is persisted via ``setx``. On other platforms the
+    user is instructed to add an export to their shell RC file.
+
+    Args:
+        args: Parsed CLI arguments (unused beyond signature consistency).
+    """
     existing = os.environ.get("CURSEFORGE_API_KEY", "")
     if existing:
-        print(f"  CURSEFORGE_API_KEY is already set.")
+        print("  CURSEFORGE_API_KEY is already set.")
         resp = input("  Overwrite it? [y/N] ").strip().lower()
         if resp != "y":
             log.info("Aborted.")
             return
 
-    print("  Get a free CurseForge API key at: https://console.curseforge.com")
+    print(
+        "  Get a free CurseForge API key at: https://console.curseforge.com"
+    )
     key = input("  Paste your API key: ").strip()
     if not key:
         log.info("Aborted.")
@@ -458,37 +738,50 @@ def cmd_init(args):
 
     if sys.platform == "win32":
         import subprocess
+
         result = subprocess.run(
             ["setx", "CURSEFORGE_API_KEY", key],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0:
             os.environ["CURSEFORGE_API_KEY"] = key
             log.info("API key saved to your user environment variables.")
-            log.info("It will be available in all new terminals automatically.")
+            log.info(
+                "It will be available in all new terminals automatically."
+            )
             log.info("This terminal session is also ready to go.")
         else:
             log.error(f"setx failed: {result.stderr.strip()}")
-            log.error("You can set it manually: setx CURSEFORGE_API_KEY \"your-key\"")
+            log.error(
+                'You can set it manually: '
+                'setx CURSEFORGE_API_KEY "your-key"'
+            )
             sys.exit(1)
     else:
         os.environ["CURSEFORGE_API_KEY"] = key
         shell = os.environ.get("SHELL", "")
-        if "zsh" in shell:
-            rc = "~/.zshrc"
-        else:
-            rc = "~/.bashrc"
-        log.info(f"API key set for this session.")
+        rc = "~/.zshrc" if "zsh" in shell else "~/.bashrc"
+        log.info("API key set for this session.")
         log.info(f"To make it permanent, add this to {rc}:")
         log.info(f'  export CURSEFORGE_API_KEY="{key}"')
 
 
-def cmd_install(args):
+def cmd_install(args: argparse.Namespace) -> None:
+    """Install one or more addons from CurseForge.
+
+    Addons can be specified as positional arguments (slugs, names, or
+    numeric IDs) and/or loaded from a requirements file via ``-r``.
+
+    Args:
+        args: Parsed CLI arguments containing ``addons``, ``requirements``,
+            ``flavor``, and ``key``.
+    """
     key = _api_key(args)
     flavor = _detect_flavor(getattr(args, "flavor", None))
     flavor_id = FLAVORS.get(flavor)
 
-    identifiers = list(args.addons or [])
+    identifiers: list[str] = list(args.addons or [])
 
     if args.requirements:
         path = Path(args.requirements)
@@ -498,7 +791,8 @@ def cmd_install(args):
         log.debug(f"Reading requirements from {path}")
         with open(path, encoding="utf-8") as f:
             identifiers.extend(
-                line.strip().split("#")[0].strip() for line in f
+                line.strip().split("#")[0].strip()
+                for line in f
                 if line.strip() and not line.strip().startswith("#")
             )
 
@@ -507,7 +801,7 @@ def cmd_install(args):
         sys.exit(1)
 
     by_project, _ = _scan_addons()
-    installed_pids = set(by_project.keys())
+    installed_pids: set[int] = set(by_project.keys())
 
     for ident in identifiers:
         log.info(f"Resolving {ident}...")
@@ -516,14 +810,18 @@ def cmd_install(args):
             log.warning(f"Not found: {ident}")
             continue
 
-        name = mod["name"]
-        mod_id = mod["id"]
+        name: str = mod["name"]
+        mod_id: int = mod["id"]
 
         if mod_id in installed_pids:
-            log.warning(f"{name} is already installed. Use 'update' instead.")
+            log.warning(
+                f"{name} is already installed. Use 'update' instead."
+            )
             continue
 
-        log.info(f"  Found: {name}  (slug: {mod['slug']}, id: {mod_id})")
+        log.info(
+            f"  Found: {name}  (slug: {mod['slug']}, id: {mod_id})"
+        )
 
         files = _get_files(key, mod_id, flavor_id)
         latest = _pick_file(files)
@@ -547,7 +845,17 @@ def cmd_install(args):
     log.info("Done.")
 
 
-def cmd_update(args):
+def cmd_update(args: argparse.Namespace) -> None:
+    """Check for and apply updates to installed addons.
+
+    Scans the current directory for installed addons, queries CurseForge
+    for newer versions, and downloads updates as needed. Can target
+    specific addons or update all.
+
+    Args:
+        args: Parsed CLI arguments containing ``addons``, ``flavor``,
+            and ``key``.
+    """
     key = _api_key(args)
     flavor = _detect_flavor(getattr(args, "flavor", None))
     flavor_id = FLAVORS.get(flavor)
@@ -558,25 +866,38 @@ def cmd_update(args):
     if not by_project and not unmatched:
         log.error("No addons found in the current directory.")
         log.error("Make sure you're in your WoW AddOns folder:")
-        log.error("  ...\\World of Warcraft\\_retail_\\Interface\\AddOns\\")
+        log.error(
+            "  ...\\World of Warcraft\\_retail_\\Interface\\AddOns\\"
+        )
         sys.exit(1)
 
     if unmatched:
-        log.info(f"Found {len(unmatched)} addon(s) without project IDs, searching CurseForge...")
+        log.info(
+            f"Found {len(unmatched)} addon(s) without project IDs, "
+            f"searching CurseForge..."
+        )
         for u in unmatched:
-            mod = _match_folder(key, u["folder"], u.get("title"), flavor_id)
+            mod = _match_folder(
+                key, u["folder"], u.get("title"), flavor_id
+            )
             if mod:
-                pid = mod["id"]
+                pid: int = mod["id"]
                 if pid not in by_project:
-                    by_project[pid] = {
-                        "folders": [u["folder"]],
-                        "title": mod["name"],
-                        "version": u["version"],
-                    }
-                    log.info(f"  Matched {u['folder']} -> {mod['name']} (id: {pid})")
+                    by_project[pid] = ProjectData(
+                        folders=[u["folder"]],
+                        title=mod["name"],
+                        version=u["version"],
+                    )
+                    log.info(
+                        f"  Matched {u['folder']} -> "
+                        f"{mod['name']} (id: {pid})"
+                    )
                 else:
                     by_project[pid]["folders"].append(u["folder"])
-                    log.debug(f"  {u['folder']} grouped under existing project {pid}")
+                    log.debug(
+                        f"  {u['folder']} grouped under "
+                        f"existing project {pid}"
+                    )
 
     if not by_project:
         log.info("No CurseForge addons detected. Nothing to update.")
@@ -586,15 +907,19 @@ def cmd_update(args):
 
     targets = by_project
     if args.addons:
-        requested = set(args.addons)
+        requested: set[str] = set(args.addons)
         targets = {}
         for pid, data in by_project.items():
-            folder_match = any(f.lower() in requested for f in data["folders"])
+            folder_match = any(
+                f.lower() in requested for f in data["folders"]
+            )
             id_match = str(pid) in requested
             if folder_match or id_match:
                 targets[pid] = data
         if not targets:
-            log.warning("None of the specified addons were found locally.")
+            log.warning(
+                "None of the specified addons were found locally."
+            )
             return
 
     updated = 0
@@ -611,7 +936,10 @@ def cmd_update(args):
         latest = _pick_file(files)
 
         if not latest:
-            log.warning(f"No files found on CurseForge for {name} (project {pid}).")
+            log.warning(
+                f"No files found on CurseForge for {name} "
+                f"(project {pid})."
+            )
             failed += 1
             continue
 
@@ -638,13 +966,23 @@ def cmd_update(args):
         log.info(f"  Updated {name}.")
         updated += 1
 
-    log.info(f"\n{updated} updated, {skipped} up to date, {failed} failed.")
+    log.info(
+        f"\n{updated} updated, {skipped} up to date, {failed} failed."
+    )
 
 
-def cmd_remove(args):
+def cmd_remove(args: argparse.Namespace) -> None:
+    """Remove one or more installed addons.
+
+    Identifies each addon by folder name or CurseForge project ID,
+    removes all associated folders, and reports what was deleted.
+
+    Args:
+        args: Parsed CLI arguments containing ``addons``.
+    """
     by_project, unmatched = _scan_addons()
 
-    folder_to_pid = {}
+    folder_to_pid: dict[str, int] = {}
     for pid, data in by_project.items():
         for folder in data["folders"]:
             folder_to_pid[folder.lower()] = pid
@@ -652,7 +990,7 @@ def cmd_remove(args):
     for target in args.addons:
         target_lower = target.lower()
 
-        matched_pid = None
+        matched_pid: int | None = None
         if target.isdigit():
             pid = int(target)
             if pid in by_project:
@@ -684,18 +1022,30 @@ def cmd_remove(args):
     log.info("Done.")
 
 
-def cmd_list(args):
+def cmd_list(args: argparse.Namespace) -> None:
+    """List all detected addons in the current directory.
+
+    Displays CurseForge-linked addons and untracked/custom addons in
+    separate tables with title, version, and folder information.
+
+    Args:
+        args: Parsed CLI arguments (unused beyond signature consistency).
+    """
     by_project, unmatched = _scan_addons()
 
     if not by_project and not unmatched:
-        log.info("No addons found. Make sure you're in your WoW AddOns folder.")
+        log.info(
+            "No addons found. Make sure you're in your WoW AddOns folder."
+        )
         return
 
     if by_project:
         print(f"\n CurseForge addons ({len(by_project)}):")
         print(f" {'Title':<36} {'Version':<24} {'Folders'}")
         print(" " + "-" * 90)
-        for pid, data in sorted(by_project.items(), key=lambda x: x[1]["title"].lower()):
+        for _pid, data in sorted(
+            by_project.items(), key=lambda x: x[1]["title"].lower()
+        ):
             title = _truncate(data["title"], 34)
             ver = _truncate(data["version"] or "?", 22)
             folders = ", ".join(data["folders"])
@@ -715,7 +1065,16 @@ def cmd_list(args):
     print(f"\n {total} addon(s) detected.\n")
 
 
-def cmd_search(args):
+def cmd_search(args: argparse.Namespace) -> None:
+    """Search CurseForge for addons matching a query.
+
+    Displays results with name, slug, download count, and summary.
+    Already-installed addons are tagged with ``[installed]``.
+
+    Args:
+        args: Parsed CLI arguments containing ``query``, ``flavor``,
+            and ``key``.
+    """
     key = _api_key(args)
     flavor = _detect_flavor(getattr(args, "flavor", None))
     flavor_id = FLAVORS.get(flavor)
@@ -729,7 +1088,7 @@ def cmd_search(args):
         return
 
     by_project, _ = _scan_addons()
-    installed_pids = set(by_project.keys())
+    installed_pids: set[int] = set(by_project.keys())
 
     print()
     for r in results:
@@ -737,13 +1096,23 @@ def cmd_search(args):
         dl = _fmt_count(r.get("downloadCount", 0))
         summary = _truncate(r.get("summary", ""), 70)
         print(f"  {r['name']}{tag}")
-        print(f"    slug: {r['slug']}  |  id: {r['id']}  |  downloads: {dl}")
+        print(
+            f"    slug: {r['slug']}  |  id: {r['id']}  |  downloads: {dl}"
+        )
         if summary:
             print(f"    {summary}")
         print()
 
 
-def cmd_info(args):
+def cmd_info(args: argparse.Namespace) -> None:
+    """Display detailed information about a specific addon.
+
+    Shows name, slug, ID, authors, download count, summary, URL, and
+    local installation status.
+
+    Args:
+        args: Parsed CLI arguments containing ``addon`` and ``key``.
+    """
     key = _api_key(args)
 
     log.info(f"Looking up {args.addon}...")
@@ -762,17 +1131,28 @@ def cmd_info(args):
     print(f"  Authors:    {authors}")
     print(f"  Downloads:  {mod.get('downloadCount', 0):,.0f}")
     print(f"  Summary:    {mod.get('summary', 'N/A')}")
-    print(f"  URL:        https://www.curseforge.com/wow/addons/{mod['slug']}")
+    print(
+        f"  URL:        https://www.curseforge.com/wow/addons/{mod['slug']}"
+    )
     if local:
         print(f"  Installed:  {local['version'] or '?'}")
         print(f"  Folders:    {', '.join(local['folders'])}")
     else:
-        print(f"  Installed:  no")
+        print("  Installed:  no")
 
 
-def cmd_freeze(args):
+def cmd_freeze(args: argparse.Namespace) -> None:
+    """Print CurseForge project IDs for all installed addons.
+
+    Output format is compatible with ``install -r`` for backup/sharing.
+
+    Args:
+        args: Parsed CLI arguments (unused beyond signature consistency).
+    """
     by_project, _ = _scan_addons()
-    for pid, data in sorted(by_project.items(), key=lambda x: x[1]["title"].lower()):
+    for pid, data in sorted(
+        by_project.items(), key=lambda x: x[1]["title"].lower()
+    ):
         print(f"{pid}  # {data['title']}")
 
 
@@ -780,63 +1160,82 @@ def cmd_freeze(args):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
+    """Parse arguments and dispatch to the appropriate command handler."""
     parser = argparse.ArgumentParser(
         prog="wowaddons",
         description="Lightweight WoW Addon Package Manager (CurseForge)",
-        epilog="Run from your WoW AddOns folder. Set CURSEFORGE_API_KEY env var or pass --key.",
+        epilog=(
+            "Run from your WoW AddOns folder. "
+            "Set CURSEFORGE_API_KEY env var or pass --key."
+        ),
     )
     parser.add_argument(
-        "-V", "--version", action="version", version=f"%(prog)s {__version__}"
+        "-V", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v", "--verbose",
+        action="store_true",
         help="Show debug output (API calls, temp paths, zip contents)",
     )
     parser.add_argument(
-        "-q", "--quiet", action="store_true",
+        "-q", "--quiet",
+        action="store_true",
         help="Suppress all output except warnings and errors",
     )
     parser.add_argument(
-        "--key", metavar="KEY",
+        "--key",
+        metavar="KEY",
         help="CurseForge API key (or set CURSEFORGE_API_KEY env var)",
     )
     parser.add_argument(
-        "--flavor", choices=FLAVORS.keys(),
+        "--flavor",
+        choices=FLAVORS.keys(),
         help="Override auto-detected game flavor",
     )
     sub = parser.add_subparsers(dest="command")
 
-    # init
     sub.add_parser("init", help="Set up your CurseForge API key")
 
-    # install
     p = sub.add_parser("install", help="Install addon(s)")
-    p.add_argument("addons", nargs="*", help="Addon slug(s), name(s), or CurseForge ID(s)")
-    p.add_argument("-r", "--requirements", metavar="FILE", help="Install from a text file (one per line)")
+    p.add_argument(
+        "addons", nargs="*",
+        help="Addon slug(s), name(s), or CurseForge ID(s)",
+    )
+    p.add_argument(
+        "-r", "--requirements",
+        metavar="FILE",
+        help="Install from a text file (one per line)",
+    )
 
-    # update
     p = sub.add_parser("update", help="Update installed addon(s)")
-    p.add_argument("addons", nargs="*", help="Folder name(s) or project ID(s) to update (omit for all)")
+    p.add_argument(
+        "addons", nargs="*",
+        help="Folder name(s) or project ID(s) to update (omit for all)",
+    )
 
-    # remove / uninstall
     for name in ("remove", "uninstall"):
         p = sub.add_parser(name, help="Remove addon(s)")
-        p.add_argument("addons", nargs="+", help="Folder name(s) or project ID(s) to remove")
+        p.add_argument(
+            "addons", nargs="+",
+            help="Folder name(s) or project ID(s) to remove",
+        )
 
-    # list
     sub.add_parser("list", help="List all detected addons")
 
-    # search
     p = sub.add_parser("search", help="Search CurseForge for addons")
     p.add_argument("query", nargs="+", help="Search terms")
 
-    # info
     p = sub.add_parser("info", help="Show details for an addon")
     p.add_argument("addon", help="Addon slug, name, or CurseForge ID")
 
-    # freeze
-    sub.add_parser("freeze", help="Print CurseForge project IDs (for use with install -r)")
+    sub.add_parser(
+        "freeze",
+        help="Print CurseForge project IDs (for use with install -r)",
+    )
 
     args = parser.parse_args()
 
@@ -855,7 +1254,7 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    dispatch = {
+    dispatch: dict[str, Any] = {
         "init": cmd_init,
         "install": cmd_install,
         "update": cmd_update,
