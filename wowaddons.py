@@ -857,37 +857,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             log.warning(f"Not found: {ident}")
             continue
 
-        name: str = mod["name"]
-        mod_id: int = mod["id"]
-
-        if mod_id in installed_pids:
-            log.warning(
-                f"{name} is already installed. Use 'update' instead."
-            )
-            continue
-
-        log.info(
-            f"  Found: {name}  (slug: {mod['slug']}, id: {mod_id})"
-        )
-
-        files = _get_files(key, mod_id, flavor_id)
-        latest = _pick_file(files)
-        if not latest:
-            log.warning(f"No {flavor} files available for {name}.")
-            continue
-
-        url = _download_url(latest)
-        version = latest.get("displayName", latest.get("fileName", "unknown"))
-        size = latest.get("fileLength", 0)
-        size_str = f" ({_fmt_size(size)})" if size else ""
-        log.info(f"  Downloading {version}{size_str}...")
-
-        folders = _download_extract(url, ".")
-        if folders is None:
-            continue
-
-        log.info(f"  Installed {name}  [{', '.join(folders)}]")
-        installed_pids.add(mod_id)
+        _install_mod(mod, key, flavor, flavor_id, installed_pids)
 
     log.info("Done.")
 
@@ -1150,11 +1120,63 @@ def cmd_list(args: argparse.Namespace) -> None:
     print(f"\n {total} addon(s) detected.\n")
 
 
+def _install_mod(
+    mod: dict[str, Any],
+    key: str,
+    flavor: str,
+    flavor_id: int | None,
+    installed_pids: set[int],
+) -> bool:
+    """Download and install a single addon from its CurseForge mod dict.
+
+    Args:
+        mod: CurseForge mod data dict.
+        key: CurseForge API key.
+        flavor: Flavor name string (for log messages).
+        flavor_id: Game-version type ID for file filtering.
+        installed_pids: Set of already-installed project IDs (updated on
+            success).
+
+    Returns:
+        ``True`` if the addon was installed successfully.
+    """
+    name: str = mod["name"]
+    mod_id: int = mod["id"]
+
+    if mod_id in installed_pids:
+        log.warning(f"{name} is already installed. Use 'update' instead.")
+        return False
+
+    log.info(f"  Found: {name}  (slug: {mod['slug']}, id: {mod_id})")
+
+    files = _get_files(key, mod_id, flavor_id)
+    latest = _pick_file(files)
+    if not latest:
+        log.warning(f"No {flavor} files available for {name}.")
+        return False
+
+    url = _download_url(latest)
+    version = latest.get("displayName", latest.get("fileName", "unknown"))
+    size = latest.get("fileLength", 0)
+    size_str = f" ({_fmt_size(size)})" if size else ""
+    log.info(f"  Downloading {version}{size_str}...")
+
+    folders = _download_extract(url, ".")
+    if folders is None:
+        return False
+
+    log.info(f"  Installed {name}  [{', '.join(folders)}]")
+    installed_pids.add(mod_id)
+    return True
+
+
 def cmd_search(args: argparse.Namespace) -> None:
     """Search CurseForge for addons matching a query.
 
-    Displays results with name, slug, download count, and summary.
-    Already-installed addons are tagged with ``[installed]``.
+    Displays numbered results with name, slug, download count, and
+    summary. Already-installed addons are tagged with ``[installed]``.
+    After displaying results, prompts the user to enter a number to
+    install one of the results, or press Enter / type ``q`` to exit.
 
     Args:
         args: Parsed CLI arguments containing ``query``, ``flavor``,
@@ -1176,17 +1198,36 @@ def cmd_search(args: argparse.Namespace) -> None:
     installed_pids: set[int] = set(by_project.keys())
 
     print()
-    for r in results:
+    for i, r in enumerate(results, 1):
         tag = " [installed]" if r["id"] in installed_pids else ""
         dl = _fmt_count(r.get("downloadCount", 0))
         summary = _truncate(r.get("summary", ""), 70)
-        print(f"  {r['name']}{tag}")
+        print(f"  {i}. {r['name']}{tag}")
         print(
-            f"    slug: {r['slug']}  |  id: {r['id']}  |  downloads: {dl}"
+            f"     slug: {r['slug']}  |  id: {r['id']}  |  downloads: {dl}"
         )
         if summary:
-            print(f"    {summary}")
+            print(f"     {summary}")
         print()
+
+    try:
+        choice = input(
+            "Enter a number to install, or press Enter to exit: "
+        ).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not choice or choice.lower() == "q":
+        return
+
+    if not choice.isdigit() or not (1 <= int(choice) <= len(results)):
+        log.warning(f"Invalid selection: {choice}")
+        return
+
+    selected = results[int(choice) - 1]
+    _install_mod(selected, key, flavor, flavor_id, installed_pids)
+    log.info("Done.")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
