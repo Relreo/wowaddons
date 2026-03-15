@@ -35,7 +35,7 @@ __version__ = "1.1.0"
 
 CF_API: str = "https://api.curseforge.com"
 WOW_GAME_ID: int = 1
-ADDON_CLASS_ID: int = 6
+ADDON_CLASS_ID: int = 1
 
 FLAVORS: dict[str, int] = {
     "retail": 517,
@@ -372,6 +372,11 @@ def _search(
         params["gameVersionTypeId"] = flavor_id
     resp = _api("/v1/mods/search", key, params)
     data = resp.get("data", []) if resp else []
+    if not data and flavor_id:
+        log.debug("No results with flavor filter, retrying without it")
+        params.pop("gameVersionTypeId")
+        resp = _api("/v1/mods/search", key, params)
+        data = resp.get("data", []) if resp else []
     log.debug(f"Search returned {len(data)} result(s)")
     return data
 
@@ -412,6 +417,11 @@ def _get_files(
         params["gameVersionTypeId"] = flavor_id
     resp = _api(f"/v1/mods/{mod_id}/files", key, params)
     data = resp.get("data", []) if resp else []
+    if not data and flavor_id:
+        log.debug("No files with flavor filter, retrying without it")
+        params.pop("gameVersionTypeId")
+        resp = _api(f"/v1/mods/{mod_id}/files", key, params)
+        data = resp.get("data", []) if resp else []
     log.debug(f"Found {len(data)} file(s)")
     return data
 
@@ -680,16 +690,28 @@ def _download_extract(url: str, dest: str) -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 
-def _needs_update(local_version: str, cf_file: dict[str, Any]) -> bool:
+def _needs_update(
+    local_version: str,
+    cf_file: dict[str, Any],
+    local_folders: list[str] | None = None,
+) -> bool:
     """Determine whether a local addon is outdated vs. a CurseForge file.
 
-    Returns ``False`` when the local version string appears inside the
-    CurseForge file's ``displayName`` or ``fileName``, or when the local
-    version is empty or a template placeholder (starts with ``@``).
+    Checks in order:
+    1. Skips template/empty versions.
+    2. If the local version string appears in the CurseForge display name
+       or file name, the addon is up to date.
+    3. Falls back to comparing the CurseForge file's upload date against
+       the local folder modification time — if any local folder was
+       modified after the file was uploaded, the addon is up to date.
+       This handles addons whose ``.toc`` version doesn't match the
+       CurseForge file naming convention.
 
     Args:
         local_version: The version string from the local ``.toc`` file.
         cf_file: A file-info dict from the CurseForge API.
+        local_folders: Optional list of local folder names to check
+            modification times against the CurseForge file date.
 
     Returns:
         ``True`` if the addon appears to need an update.
@@ -703,6 +725,31 @@ def _needs_update(local_version: str, cf_file: dict[str, Any]) -> bool:
         return False
 
     log.debug(f"Version mismatch: local={local_version!r}  cf={display!r}")
+
+    cf_date_str = cf_file.get("fileDate", "")
+    if cf_date_str and local_folders:
+        try:
+            from datetime import datetime, timezone
+
+            cf_date = cf_date_str.replace("Z", "+00:00")
+            cf_time = datetime.fromisoformat(cf_date)
+            for folder in local_folders:
+                p = Path(folder)
+                if p.is_dir():
+                    mtime = datetime.fromtimestamp(
+                        p.stat().st_mtime, tz=timezone.utc
+                    )
+                    if mtime > cf_time:
+                        log.debug(
+                            f"Folder '{folder}' modified after CF upload "
+                            f"({mtime:%Y-%m-%d %H:%M} > "
+                            f"{cf_time:%Y-%m-%d %H:%M}), "
+                            f"treating as up to date"
+                        )
+                        return False
+        except (ValueError, OSError):
+            pass
+
     return True
 
 
@@ -871,33 +918,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    if unmatched:
-        log.info(
-            f"Found {len(unmatched)} addon(s) without project IDs, "
-            f"searching CurseForge..."
-        )
-        for u in unmatched:
-            mod = _match_folder(
-                key, u["folder"], u.get("title"), flavor_id
-            )
-            if mod:
-                pid: int = mod["id"]
-                if pid not in by_project:
-                    by_project[pid] = ProjectData(
-                        folders=[u["folder"]],
-                        title=mod["name"],
-                        version=u["version"],
-                    )
-                    log.info(
-                        f"  Matched {u['folder']} -> "
-                        f"{mod['name']} (id: {pid})"
-                    )
-                else:
-                    by_project[pid]["folders"].append(u["folder"])
-                    log.debug(
-                        f"  {u['folder']} grouped under "
-                        f"existing project {pid}"
-                    )
+    _match_unmatched(key, by_project, unmatched, flavor_id)
 
     if not by_project:
         log.info("No CurseForge addons detected. Nothing to update.")
@@ -943,7 +964,7 @@ def cmd_update(args: argparse.Namespace) -> None:
             failed += 1
             continue
 
-        if not _needs_update(local_ver, latest):
+        if not _needs_update(local_ver, latest, data["folders"]):
             log.info(f"  {name} is up to date.")
             skipped += 1
             continue
@@ -1022,6 +1043,60 @@ def cmd_remove(args: argparse.Namespace) -> None:
     log.info("Done.")
 
 
+def _match_unmatched(
+    key: str,
+    by_project: dict[int, ProjectData],
+    unmatched: list[UnmatchedAddon],
+    flavor_id: int | None = None,
+) -> list[UnmatchedAddon]:
+    """Try to match unmatched addon folders to CurseForge projects.
+
+    Moves successfully matched addons from ``unmatched`` into
+    ``by_project`` (mutated in place).
+
+    Args:
+        key: CurseForge API key.
+        by_project: Mutable dict of known projects (updated in place).
+        unmatched: List of addon folders without a project ID.
+        flavor_id: Optional game-version type ID to filter by flavor.
+
+    Returns:
+        The subset of ``unmatched`` entries that could not be matched.
+    """
+    still_unmatched: list[UnmatchedAddon] = []
+    if not unmatched:
+        return still_unmatched
+
+    log.info(
+        f"Found {len(unmatched)} addon(s) without project IDs, "
+        f"searching CurseForge..."
+    )
+    for u in unmatched:
+        mod = _match_folder(key, u["folder"], u.get("title"), flavor_id)
+        if mod:
+            pid: int = mod["id"]
+            if pid not in by_project:
+                by_project[pid] = ProjectData(
+                    folders=[u["folder"]],
+                    title=mod["name"],
+                    version=u["version"],
+                )
+                log.info(
+                    f"  Matched {u['folder']} -> "
+                    f"{mod['name']} (id: {pid})"
+                )
+            else:
+                by_project[pid]["folders"].append(u["folder"])
+                log.debug(
+                    f"  {u['folder']} grouped under "
+                    f"existing project {pid}"
+                )
+        else:
+            still_unmatched.append(u)
+
+    return still_unmatched
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     """List all detected addons in the current directory.
 
@@ -1038,6 +1113,16 @@ def cmd_list(args: argparse.Namespace) -> None:
             "No addons found. Make sure you're in your WoW AddOns folder."
         )
         return
+
+    key = os.environ.get("CURSEFORGE_API_KEY", "") or getattr(
+        args, "key", None
+    )
+    if key and unmatched:
+        flavor = _detect_flavor(getattr(args, "flavor", None))
+        flavor_id = FLAVORS.get(flavor)
+        unmatched = _match_unmatched(
+            key, by_project, unmatched, flavor_id
+        )
 
     if by_project:
         print(f"\n CurseForge addons ({len(by_project)}):")
