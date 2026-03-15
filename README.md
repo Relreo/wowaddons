@@ -1,81 +1,63 @@
 # wowaddons - WoW Addon Package Manager
 
-A lightweight, single-file Python CLI for managing World of Warcraft addons via CurseForge.  
-Zero external dependencies. No telemetry. Only checks versions and downloads zips.
+A lightweight, stateless Python CLI for managing World of Warcraft addons via CurseForge.  
+Zero external dependencies. Zero stored state. No telemetry.
 
-## Install
+## Install the tool
 
 ```
 pip install -e "c:\Users\relre\Documents\Python Tools\wowaddons"
 ```
 
-This registers the `wowaddons` command globally. The `-e` flag means editable -- any changes to the source take effect immediately without reinstalling.
-
-To uninstall later: `pip uninstall wowaddons`
+To uninstall: `pip uninstall wowaddons`
 
 ## Setup
 
-1. **Get a free CurseForge API key** at https://console.curseforge.com  
-2. **`cd` into your WoW AddOns folder**, e.g.:
+1. Get a free CurseForge API key at https://console.curseforge.com
+2. Set it as an environment variable (persists across sessions):
    ```
-   cd "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns"
+   setx CURSEFORGE_API_KEY "your-key-here"
    ```
-3. **Initialize:**
-   ```
-   wowaddons init
-   ```
-   Paste your API key and choose a flavor (`retail`, `classic`, or `classic_era`).
+3. Open a **new** terminal for the variable to take effect.
 
-## Commands
+## Usage
+
+Navigate to your WoW AddOns folder and run commands:
+
+```
+cd "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns"
+```
 
 | Command | Description |
 |---------|-------------|
-| `init` | Configure API key and game flavor |
-| `install <slug ...>` | Install one or more addons by slug, name, or CurseForge ID |
-| `install -r addons.txt` | Install from a file (one slug per line) |
-| `update` | Update all installed addons |
-| `update <slug ...>` | Update specific addon(s) |
-| `remove <slug ...>` | Remove addon(s) and delete their folders |
-| `list` | Show all installed addons |
+| `update` | Scan all addons, check CurseForge for updates, download what's new |
+| `update <folder>` | Update a specific addon |
+| `install <slug ...>` | Install new addon(s) by slug, name, or CurseForge ID |
+| `install -r addons.txt` | Install from a file (one per line, `freeze` format) |
+| `remove <folder>` | Remove an addon and all its related folders |
+| `list` | List all detected addons (CurseForge + custom) |
 | `search <query>` | Search CurseForge |
 | `info <slug>` | Show details for an addon |
-| `freeze` | Print installed slugs (pipe to a file for sharing) |
+| `freeze` | Print project IDs (for sharing/backup, works with `install -r`) |
 
-## Examples
+### Flags
 
-```bash
-# Search for an addon
-wowaddons search damage meter
-
-# Install by slug (shown in search results)
-wowaddons install details
-
-# Install multiple at once
-wowaddons install deadly-boss-mods weakauras-2 details
-
-# Update everything
-wowaddons update
-
-# Export your addon list, share it, reinstall on another machine
-wowaddons freeze > my-addons.txt
-wowaddons install -r my-addons.txt
-
-# Remove an addon
-wowaddons remove details
-```
+| Flag | Description |
+|------|-------------|
+| `-v` | Verbose: show API calls, temp paths, version comparisons |
+| `-q` | Quiet: suppress everything except warnings and errors |
+| `--key KEY` | Pass API key directly (alternative to env var) |
+| `--flavor` | Override auto-detected flavor (retail/classic/classic_era) |
 
 ## How It Works
 
-- Stores a `wowaddons.json` manifest in the current directory tracking installed addons, their CurseForge IDs, file versions, and which folders they extracted.
-- On **install/update**, downloads the zip to a temp directory first, validates it, then moves clean folders into place.
-- On **remove**, deletes the exact folders that were extracted during install.
-- API key can also be set via the `CURSEFORGE_API_KEY` environment variable.
+- Reads `.toc` files at runtime for addon metadata (`Title`, `Version`, `X-Curse-Project-ID`)
+- Groups folders sharing the same CurseForge project ID (e.g., Details + Details_DataStorage)
+- Compares local `.toc` version against CurseForge's latest file to decide what needs updating
+- Downloads to a temp directory, validates the zip, then moves clean folders into place
+- Game flavor is auto-detected from the directory path (`_retail_`, `_classic_`, `_classic_era_`)
+- **No files are created or stored** -- all state is derived at runtime
 
 ## Privacy
 
-wowaddons sends **zero** information about your machine. The only network requests it makes are:
-
-- CurseForge API queries (search, version checks) authenticated with *your* API key
-- Zip file downloads from CurseForge CDN
-
-No analytics, no tracking, no fingerprinting.
+Only sends your API key and `wowaddons/<version>` as User-Agent. No local paths, system info, or telemetry.
