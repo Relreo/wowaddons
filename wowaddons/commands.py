@@ -171,14 +171,19 @@ def _install_mod(
     slug: str = mod.get("slug", "")
 
     if mod_id in installed_pids:
+        warn = colorize("⚠", AnsiCodes.YELLOW)
+        wname = colorize(name, AnsiCodes.WHITE)
         print(
-            f"  {colorize('⚠', AnsiCodes.YELLOW)} {colorize(name, AnsiCodes.WHITE)} is already installed. "
+            f"  {warn} {wname} is already installed. "
             "Use 'update' instead."
         )
         return False
 
     slug_str = colorize(f"slug: {slug}  id: {mod_id}", AnsiCodes.GRAY)
-    print(f"  {colorize('✓', AnsiCodes.GREEN)} Found: {colorize(name, AnsiCodes.WHITE)}  {slug_str}")
+    print(
+        f"  {colorize('✓', AnsiCodes.GREEN)} Found: "
+        f"{colorize(name, AnsiCodes.WHITE)}  {slug_str}"
+    )
 
     files = get_files(key, mod_id, flavor_id)
     latest = pick_file(files)
@@ -190,7 +195,10 @@ def _install_mod(
     version = latest.get("displayName", latest.get("fileName", "unknown"))
     size = latest.get("fileLength", 0)
     size_str = colorize(f"  {format_size(size)}", AnsiCodes.GRAY) if size else ""
-    print(f"  {colorize('↓', AnsiCodes.CYAN)} Downloading {colorize(version, AnsiCodes.WHITE)}{size_str}...")
+    ver_c = colorize(version, AnsiCodes.WHITE)
+    print(
+        f"  {colorize('↓', AnsiCodes.CYAN)} Downloading {ver_c}{size_str}..."
+    )
 
     folders = download_extract(url, ".", label=name)
     if folders is None:
@@ -201,7 +209,10 @@ def _install_mod(
             record_match(cache, folder, mod_id, name, slug)
 
     folders_str = colorize(f"[{', '.join(folders)}]", AnsiCodes.GRAY)
-    print(f"  {colorize('✓', AnsiCodes.GREEN)} Installed {colorize(name, AnsiCodes.WHITE)}  {folders_str}")
+    print(
+        f"  {colorize('✓', AnsiCodes.GREEN)} Installed "
+        f"{colorize(name, AnsiCodes.WHITE)}  {folders_str}"
+    )
     installed_pids.add(mod_id)
     return True
 
@@ -306,7 +317,12 @@ def cmd_init(_args: argparse.Namespace) -> None:
         )
         if result.returncode == 0:
             os.environ["CURSEFORGE_API_KEY"] = key
-            print(colorize("  ✓ API key saved to your user environment variables.", AnsiCodes.GREEN))
+            print(
+                colorize(
+                    "  ✓ API key saved to your user environment variables.",
+                    AnsiCodes.GREEN,
+                )
+            )
             print("  It will be available in all new terminals automatically.")
             print("  This terminal session is also ready to go.")
         else:
@@ -325,30 +341,14 @@ def cmd_init(_args: argparse.Namespace) -> None:
         print('  export CURSEFORGE_API_KEY="<your-key>"')
 
 
-def cmd_install(args: argparse.Namespace) -> None:
-    """Install one or more addons from CurseForge."""
+def _install_from_identifiers(
+    args: argparse.Namespace,
+    identifiers: list[str],
+) -> None:
+    """Resolve and install each identifier (slug, name, or CurseForge ID)."""
     key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
     flavor_id = FLAVORS.get(flavor)
-
-    identifiers: list[str] = list(args.addons or [])
-
-    if args.requirements:
-        path = Path(args.requirements)
-        if not path.exists():
-            log.error("File not found: %s", path)
-            sys.exit(1)
-        log.debug("Reading requirements from %s", path)
-        with open(path, encoding="utf-8") as f:
-            identifiers.extend(
-                line.strip().split("#")[0].strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            )
-
-    if not identifiers:
-        log.error("Specify addon(s) to install, or use -r <file>.")
-        sys.exit(1)
 
     by_project, _ = scan_addons()
     installed_pids: set[int] = set(by_project.keys())
@@ -356,7 +356,9 @@ def cmd_install(args: argparse.Namespace) -> None:
     cache_changed = False
 
     for ident in identifiers:
-        print(f"\n  {colorize('▸', AnsiCodes.CYAN)} Resolving {colorize(ident, AnsiCodes.WHITE)}...")
+        arrow = colorize("▸", AnsiCodes.CYAN)
+        ident_c = colorize(ident, AnsiCodes.WHITE)
+        print(f"\n  {arrow} Resolving {ident_c}...")
         mod = resolve(key, ident, flavor_id)
         if not mod:
             print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {ident}")
@@ -369,6 +371,31 @@ def cmd_install(args: argparse.Namespace) -> None:
         save_id_cache(cache)
 
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    """Install one or more addons from CurseForge."""
+    identifiers = list(args.addons or [])
+    if not identifiers:
+        log.error("Specify at least one addon (slug, name, or CurseForge ID).")
+        sys.exit(1)
+    _install_from_identifiers(args, identifiers)
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    """Install addons listed in an ``export`` snapshot file."""
+    from .snapshot import parse_snapshot_file
+
+    path = Path(args.file)
+    if not path.is_file():
+        log.error("Not a file: %s", path)
+        sys.exit(1)
+    identifiers = parse_snapshot_file(path)
+    if not identifiers:
+        log.error("No project IDs found in %s", path)
+        sys.exit(1)
+    log.debug("Importing %s identifier(s) from %s", len(identifiers), path)
+    _install_from_identifiers(args, identifiers)
 
 
 def cmd_update(args: argparse.Namespace) -> None:
@@ -498,9 +525,11 @@ def cmd_update(args: argparse.Namespace) -> None:
         new_ver = latest.get("displayName", latest.get("fileName", "?"))
         size = latest.get("fileLength", 0)
         size_str = colorize(f"({format_size(size)})", AnsiCodes.GRAY) if size else ""
+        up = colorize("↑", AnsiCodes.CYAN)
+        new_ver_c = colorize(new_ver, AnsiCodes.CYAN)
         print(
             f"\r  {counter} {name_str}  "
-            f"{colorize('↑', AnsiCodes.CYAN)} {colorize(new_ver, AnsiCodes.CYAN)}  {size_str}          "
+            f"{up} {new_ver_c}  {size_str}          "
         )
 
         for folder in data["folders"]:
@@ -628,7 +657,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         save_id_cache(cache)
 
     if by_project:
-        header = colorize(f"  CurseForge addons ({len(by_project)})", AnsiCodes.CYAN + AnsiCodes.BOLD)
+        hdr = f"  CurseForge addons ({len(by_project)})"
+        header = colorize(hdr, AnsiCodes.CYAN + AnsiCodes.BOLD)
         print(f"\n{header}")
         col_title = colorize(f"  {'Title':<36}", AnsiCodes.GRAY)
         col_ver = colorize(f"{'Version':<24}", AnsiCodes.GRAY)
@@ -741,7 +771,9 @@ def cmd_info(args: argparse.Namespace) -> None:
     """Display detailed information about a specific addon."""
     key = get_api_key(args)
 
-    print(f"\n  {colorize('▸', AnsiCodes.CYAN)} Looking up {colorize(args.addon, AnsiCodes.WHITE)}...")
+    lu = colorize("▸", AnsiCodes.CYAN)
+    addon_c = colorize(args.addon, AnsiCodes.WHITE)
+    print(f"\n  {lu} Looking up {addon_c}...")
     mod = resolve(key, args.addon)
     if not mod:
         print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {args.addon}")
@@ -776,10 +808,48 @@ def cmd_info(args: argparse.Namespace) -> None:
     print()
 
 
-def cmd_freeze(_args: argparse.Namespace) -> None:
-    """Print CurseForge project IDs for all installed addons."""
-    by_project, _ = scan_addons()
-    for pid, data in sorted(
-        by_project.items(), key=lambda x: x[1]["title"].lower()
-    ):
-        print(f"{pid}  # {data['title']}")
+def cmd_export(args: argparse.Namespace) -> None:
+    """Write a snapshot of addons that can be tied to CurseForge (toc ID or cache)."""
+    from .snapshot import EXPORT_FORMAT_LINE
+
+    by_project, unmatched = scan_addons()
+    cache = load_id_cache()
+
+    exported: dict[int, str] = {}
+    for pid, data in by_project.items():
+        exported[pid] = data["title"]
+
+    for u in unmatched:
+        entry = cache.get(u["folder"])
+        if not entry:
+            continue
+        pid = int(entry["id"])
+        if pid not in exported:
+            exported[pid] = entry.get("name", u["title"])
+
+    lines = [
+        EXPORT_FORMAT_LINE,
+        "# Share this file; recipients run: wowaddons import <path>",
+        "# Each data line is a CurseForge project ID (# title is optional).",
+        "",
+    ]
+    if not exported:
+        lines.append(
+            "# No CurseForge-backed addons found "
+            "(X-Curse-Project-ID in .toc, or matched folders in your ID cache)."
+        )
+        lines.append("")
+
+    for pid in sorted(exported.keys(), key=lambda p: exported[p].lower()):
+        lines.append(f"{pid}  # {exported[pid]}")
+
+    text = "\n".join(lines) + "\n"
+    dest = getattr(args, "outfile", None)
+    if dest:
+        Path(dest).write_text(text, encoding="utf-8")
+        n = len(exported)
+        msg = f"  ✓ Wrote {n} project(s) to {dest}"
+        print(colorize(msg, AnsiCodes.GREEN))
+        print()
+    else:
+        sys.stdout.write(text)

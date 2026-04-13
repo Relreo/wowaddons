@@ -7,7 +7,6 @@ import logging
 CF_API: str = "https://api.curseforge.com"
 WOW_GAME_ID: int = 1
 ADDON_CLASS_ID: int = 1
-CACHE_FILE: str = ".wowaddons_cache.json"
 
 FLAVORS: dict[str, int] = {
     "retail": 517,

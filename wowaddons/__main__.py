@@ -6,17 +6,7 @@ import argparse
 import logging
 import sys
 
-from . import __version__
-from .commands import (
-    cmd_freeze,
-    cmd_info,
-    cmd_init,
-    cmd_install,
-    cmd_list,
-    cmd_remove,
-    cmd_search,
-    cmd_update,
-)
+from . import __version__, commands
 from .constants import FLAVORS, log
 from .ui import LogFormatter, enable_ansi
 
@@ -62,13 +52,17 @@ def main() -> None:
 
     p = sub.add_parser("install", help="Install addon(s)")
     p.add_argument(
-        "addons", nargs="*",
+        "addons", nargs="+",
         help="Addon slug(s), name(s), or CurseForge ID(s)",
     )
+
+    p = sub.add_parser(
+        "import",
+        help="Install addons from an export snapshot file",
+    )
     p.add_argument(
-        "-r", "--requirements",
-        metavar="FILE",
-        help="Install from a text file (one per line)",
+        "file",
+        help="Path to a file produced by wowaddons export",
     )
 
     p = sub.add_parser("update", help="Update installed addon(s)")
@@ -92,9 +86,14 @@ def main() -> None:
     p = sub.add_parser("info", help="Show details for an addon")
     p.add_argument("addon", help="Addon slug, name, or CurseForge ID")
 
-    sub.add_parser(
-        "freeze",
-        help="Print CurseForge project IDs (for use with install -r)",
+    p = sub.add_parser(
+        "export",
+        help="Write a snapshot of CurseForge-backed addons (share with import)",
+    )
+    p.add_argument(
+        "outfile",
+        nargs="?",
+        help="Optional path to write (default: print to stdout)",
     )
 
     args = parser.parse_args()
@@ -117,15 +116,16 @@ def main() -> None:
         sys.exit(0)
 
     dispatch = {
-        "init": cmd_init,
-        "install": cmd_install,
-        "update": cmd_update,
-        "remove": cmd_remove,
-        "uninstall": cmd_remove,
-        "list": cmd_list,
-        "search": cmd_search,
-        "info": cmd_info,
-        "freeze": cmd_freeze,
+        "init": commands.cmd_init,
+        "install": commands.cmd_install,
+        "import": commands.cmd_import,
+        "update": commands.cmd_update,
+        "remove": commands.cmd_remove,
+        "uninstall": commands.cmd_remove,
+        "list": commands.cmd_list,
+        "search": commands.cmd_search,
+        "info": commands.cmd_info,
+        "export": commands.cmd_export,
     }
     dispatch[args.command](args)
 

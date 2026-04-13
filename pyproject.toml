@@ -1,6 +1,6 @@
 [project]
 name = "wowaddons"
-version = "1.2.0"
+version = "1.4.0"
 description = "Lightweight WoW Addon Package Manager (CurseForge)"
 requires-python = ">=3.8"
 
