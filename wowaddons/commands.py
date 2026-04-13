@@ -763,7 +763,9 @@ def cmd_search(args: argparse.Namespace) -> None:
 
     selected = results[int(choice) - 1]
     print()
-    _install_mod(selected, key, flavor, flavor_id, installed_pids)
+    cache = load_id_cache()
+    if _install_mod(selected, key, flavor, flavor_id, installed_pids, cache):
+        save_id_cache(cache)
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
 
 

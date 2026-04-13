@@ -101,7 +101,9 @@ You can also pipe or redirect: `wowaddons export > my-addons.txt`.
 - Addons that don't embed a project ID are matched to CurseForge via slug and
   fuzzy name search, then cached under your user data directory (Windows:
   `%LOCALAPPDATA%\wowaddons\caches\`) so future runs don't need extra API calls.
-  Each AddOns folder path gets its own cache file (by hash).
+  Each AddOns folder path gets its own cache file (by hash). Successful installs
+  via `install`, `import`, or interactive `search` record extracted folder names
+  in that cache; `update` and `list` can extend it when matching unknown folders.
 - Sub-packages (e.g. `BigWigs_Core` under `BigWigs`) are automatically grouped
   under their parent project without any API calls
 - Game flavor is auto-detected from the directory path (`_retail_`, `_classic_`,
