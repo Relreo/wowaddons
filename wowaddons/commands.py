@@ -7,10 +7,11 @@ import os
 import shutil
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Any
 
-from .addons import detect_flavor, scan_addons
+from .addons import DetectedFlavor, detect_flavor, scan_addons
 from .api import (
     download_extract,
     download_url,
@@ -23,9 +24,9 @@ from .api import (
     search_addons,
 )
 from .cache import apply_id_cache, load_id_cache, record_match, save_id_cache
-from .constants import FLAVORS, log
+from .constants import log
 from .models import ProjectData, UnmatchedAddon
-from .ui import AnsiCodes, colorize
+from .ui import AnsiCodes, colorize, hyperlink
 from .utils import format_count, format_size, truncate
 
 
@@ -150,11 +151,18 @@ def group_sub_packages(
     return remaining, grouped
 
 
+def _print_game(flavor: DetectedFlavor) -> None:
+    print(
+        f"  {colorize('▸', AnsiCodes.CYAN)} Game: "
+        f"{colorize(flavor.label, AnsiCodes.WHITE)} "
+        f"{colorize(f'({flavor.source})', AnsiCodes.GRAY)}"
+    )
+
+
 def _install_mod(
     mod: dict[str, Any],
     key: str,
-    flavor: str,
-    flavor_id: int | None,
+    flavor: DetectedFlavor,
     installed_pids: set[int],
     cache: dict[str, dict[str, Any]] | None = None,
 ) -> bool:
@@ -185,10 +193,13 @@ def _install_mod(
         f"{colorize(name, AnsiCodes.WHITE)}  {slug_str}"
     )
 
-    files = get_files(key, mod_id, flavor_id)
+    files = get_files(key, mod_id, flavor.id)
     latest = pick_file(files)
     if not latest:
-        print(f"  {colorize('✗', AnsiCodes.RED)} No {flavor} files available for {name}.")
+        print(
+            f"  {colorize('✗', AnsiCodes.RED)} No {flavor.label} files "
+            f"available for {name}."
+        )
         return False
 
     url = download_url(latest)
@@ -348,7 +359,9 @@ def _install_from_identifiers(
     """Resolve and install each identifier (slug, name, or CurseForge ID)."""
     key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
-    flavor_id = FLAVORS.get(flavor)
+
+    print()
+    _print_game(flavor)
 
     by_project, _ = scan_addons()
     installed_pids: set[int] = set(by_project.keys())
@@ -359,12 +372,12 @@ def _install_from_identifiers(
         arrow = colorize("▸", AnsiCodes.CYAN)
         ident_c = colorize(ident, AnsiCodes.WHITE)
         print(f"\n  {arrow} Resolving {ident_c}...")
-        mod = resolve(key, ident, flavor_id)
+        mod = resolve(key, ident, flavor.id)
         if not mod:
             print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {ident}")
             continue
 
-        if _install_mod(mod, key, flavor, flavor_id, installed_pids, cache):
+        if _install_mod(mod, key, flavor, installed_pids, cache):
             cache_changed = True
 
     if cache_changed:
@@ -402,15 +415,18 @@ def cmd_update(args: argparse.Namespace) -> None:
     """Check for and apply updates to installed addons."""
     key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
-    flavor_id = FLAVORS.get(flavor)
+    flavor_id = flavor.id
 
-    print(f"\n  {colorize('▸', AnsiCodes.CYAN)} Scanning for installed addons...")
+    print()
+    _print_game(flavor)
+    print(f"  {colorize('▸', AnsiCodes.CYAN)} Scanning for installed addons...")
     by_project, unmatched = scan_addons()
 
     if not by_project and not unmatched:
         log.error("No addons found in the current directory.")
         log.error("Make sure you're in your WoW AddOns folder:")
         log.error("  ...\\World of Warcraft\\_retail_\\Interface\\AddOns\\")
+        log.error("  ...\\World of Warcraft\\_classic_beta_\\Interface\\AddOns\\")
         sys.exit(1)
 
     cache: dict[str, dict[str, Any]] = {}
@@ -633,6 +649,9 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 def cmd_list(args: argparse.Namespace) -> None:
     """List all detected addons in the current directory."""
+    flavor = detect_flavor(getattr(args, "flavor", None))
+    print()
+    _print_game(flavor)
     by_project, unmatched = scan_addons()
 
     if not by_project and not unmatched:
@@ -647,8 +666,7 @@ def cmd_list(args: argparse.Namespace) -> None:
     )
     if key and unmatched:
         cache = load_id_cache()
-        flavor = detect_flavor(getattr(args, "flavor", None))
-        flavor_id = FLAVORS.get(flavor)
+        flavor_id = flavor.id
         still_unmatched, _ = apply_id_cache(cache, by_project, unmatched)
         still_unmatched, _ = group_sub_packages(by_project, still_unmatched)
         unmatched = match_unmatched(
@@ -710,16 +728,16 @@ def cmd_search(args: argparse.Namespace) -> None:
     """Search CurseForge for addons matching a query."""
     key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
-    flavor_id = FLAVORS.get(flavor)
 
     query = " ".join(args.query)
+    print()
+    _print_game(flavor)
     print(
-        f"\n  {colorize('▸', AnsiCodes.CYAN)} Searching for "
-        f"{colorize(repr(query), AnsiCodes.WHITE)} "
-        f"{colorize(f'({flavor})', AnsiCodes.GRAY)}..."
+        f"  {colorize('▸', AnsiCodes.CYAN)} Searching for "
+        f"{colorize(repr(query), AnsiCodes.WHITE)}..."
     )
 
-    results = search_addons(key, query, flavor_id)
+    results = search_addons(key, query, flavor.id)
     if not results:
         print(f"  {colorize('–', AnsiCodes.GRAY)} No results found.")
         return
@@ -727,6 +745,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     by_project, _ = scan_addons()
     installed_pids: set[int] = set(by_project.keys())
 
+    urls: list[str] = []
     print()
     for i, result in enumerate(results, 1):
         is_installed = result["id"] in installed_pids
@@ -734,7 +753,13 @@ def cmd_search(args: argparse.Namespace) -> None:
         dl = format_count(result.get("downloadCount", 0))
         summary = truncate(result.get("summary", ""), 70)
         num = colorize(f"  {i}.", AnsiCodes.CYAN + AnsiCodes.BOLD)
-        name_str = colorize(result["name"], AnsiCodes.WHITE + AnsiCodes.BOLD)
+        url = (result.get("links") or {}).get("websiteUrl") or (
+            f"https://www.curseforge.com/wow/addons/{result['slug']}"
+        )
+        urls.append(url)
+        name_str = hyperlink(
+            colorize(result["name"], AnsiCodes.WHITE + AnsiCodes.BOLD), url
+        )
         meta = colorize(
             f"     slug: {result['slug']}  |  id: {result['id']}  |  ↓ {dl}",
             AnsiCodes.GRAY,
@@ -743,28 +768,40 @@ def cmd_search(args: argparse.Namespace) -> None:
         print(meta)
         if summary:
             print(colorize(f"     {summary}", AnsiCodes.GRAY))
+        print(f"     {hyperlink(colorize(url, AnsiCodes.BLUE), url)}")
         print()
 
     print(colorize("  " + "─" * 50, AnsiCodes.GRAY))
-    try:
-        choice = input(
-            colorize("  Enter a number to install, or press Enter to exit: ", AnsiCodes.WHITE)
-        ).strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
+    prompt = colorize(
+        "  Enter a number to install, o<number> to open its page, "
+        "or press Enter to exit: ",
+        AnsiCodes.WHITE,
+    )
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
 
-    if not choice or choice.lower() == "q":
-        return
+        if not choice or choice == "q":
+            return
 
-    if not choice.isdigit() or not 1 <= int(choice) <= len(results):
-        print(f"  {colorize('⚠', AnsiCodes.YELLOW)} Invalid selection: {choice}")
-        return
+        open_page = choice.startswith("o")
+        number = choice[1:].strip() if open_page else choice
+        if not number.isdigit() or not 1 <= int(number) <= len(results):
+            print(f"  {colorize('⚠', AnsiCodes.YELLOW)} Invalid selection: {choice}")
+            continue
 
-    selected = results[int(choice) - 1]
+        if open_page:
+            webbrowser.open(urls[int(number) - 1])
+            continue
+        break
+
+    selected = results[int(number) - 1]
     print()
     cache = load_id_cache()
-    if _install_mod(selected, key, flavor, flavor_id, installed_pids, cache):
+    if _install_mod(selected, key, flavor, installed_pids, cache):
         save_id_cache(cache)
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
 
@@ -772,11 +809,14 @@ def cmd_search(args: argparse.Namespace) -> None:
 def cmd_info(args: argparse.Namespace) -> None:
     """Display detailed information about a specific addon."""
     key = get_api_key(args)
+    flavor = detect_flavor(getattr(args, "flavor", None))
 
     lu = colorize("▸", AnsiCodes.CYAN)
     addon_c = colorize(args.addon, AnsiCodes.WHITE)
-    print(f"\n  {lu} Looking up {addon_c}...")
-    mod = resolve(key, args.addon)
+    print()
+    _print_game(flavor)
+    print(f"  {lu} Looking up {addon_c}...")
+    mod = resolve(key, args.addon, flavor.id)
     if not mod:
         print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {args.addon}")
         return

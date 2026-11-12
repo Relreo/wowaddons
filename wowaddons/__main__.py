@@ -7,7 +7,7 @@ import logging
 import sys
 
 from . import __version__, commands
-from .constants import FLAVORS, log
+from .constants import FLAVOR_CHOICES, log
 from .ui import LogFormatter, enable_ansi
 
 
@@ -43,8 +43,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--flavor",
-        choices=FLAVORS.keys(),
-        help="Override auto-detected game flavor",
+        choices=FLAVOR_CHOICES,
+        help=(
+            "Override auto-detected game flavor "
+            "(retail, classic, classic_era, forever, ...)"
+        ),
     )
     sub = parser.add_subparsers(dest="command")
 
