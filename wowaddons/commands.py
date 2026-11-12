@@ -11,7 +11,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from .addons import DetectedFlavor, detect_flavor, scan_addons
+from .addons import DetectedFlavor, detect_flavor, read_local_meta, scan_addons
 from .api import (
     download_extract,
     download_url,
@@ -23,8 +23,27 @@ from .api import (
     resolve,
     search_addons,
 )
-from .cache import apply_id_cache, load_id_cache, record_match, save_id_cache
+from .cache import (
+    apply_id_cache,
+    load_github_sources,
+    load_id_cache,
+    record_match,
+    save_github_sources,
+    save_id_cache,
+)
 from .constants import log
+from .github import (
+    GitHubError,
+    RemoteInfo,
+    RepoSpec,
+    entry_spec,
+    fetch_remote,
+    fetch_repo_summary,
+    install_remote,
+    is_outdated,
+    make_source_entry,
+    parse_github_spec,
+)
 from .models import ProjectData, UnmatchedAddon
 from .ui import AnsiCodes, colorize, hyperlink
 from .utils import format_count, format_size, truncate
@@ -296,6 +315,231 @@ def _update_stale(
 
 
 # ---------------------------------------------------------------------------
+# GitHub-hosted addons
+# ---------------------------------------------------------------------------
+
+
+def _remote_label(remote: RemoteInfo) -> str:
+    """Short human-readable version for a remote (falls back to tree SHA)."""
+    if not remote.is_template:
+        return remote.version
+    return remote.tree_sha[:7] if remote.tree_sha else "latest"
+
+
+def _live_github_sources(
+    sources: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Source records that still have at least one folder on disk."""
+    return {
+        key: entry for key, entry in sources.items()
+        if any(Path(f).is_dir() for f in entry["folders"])
+    }
+
+
+def _strip_tracked(
+    by_project: dict[int, ProjectData],
+    unmatched: list[UnmatchedAddon],
+    sources: dict[str, dict[str, Any]],
+) -> None:
+    """Remove GitHub-tracked folders from the CurseForge scan results.
+
+    Mutates both arguments in place so those folders are never searched on
+    CurseForge or listed as untracked.
+    """
+    tracked = {f.lower() for e in sources.values() for f in e["folders"]}
+    if not tracked:
+        return
+    for pid in list(by_project):
+        data = by_project[pid]
+        data["folders"] = [f for f in data["folders"] if f.lower() not in tracked]
+        if not data["folders"]:
+            del by_project[pid]
+    unmatched[:] = [u for u in unmatched if u["folder"].lower() not in tracked]
+
+
+def _github_match_names(key: str, entry: dict[str, Any]) -> set[str]:
+    """Lower-case names a user may type to refer to a GitHub addon."""
+    names = {f.lower() for f in entry["folders"]}
+    names.add(key)
+    names.add(entry["repo"].lower())
+    return names
+
+
+def _install_github(specs: list[RepoSpec], flavor: DetectedFlavor) -> None:
+    """Install each GitHub repository and record where it came from."""
+    sources = load_github_sources()
+    changed = False
+
+    for spec in specs:
+        print(
+            f"\n  {colorize('▸', AnsiCodes.CYAN)} Resolving "
+            f"{colorize(spec.slug, AnsiCodes.WHITE)} "
+            f"{colorize('(GitHub)', AnsiCodes.GRAY)}..."
+        )
+        existing = sources.get(spec.key)
+        if existing and any(Path(f).is_dir() for f in existing["folders"]):
+            print(
+                f"  {colorize('⚠', AnsiCodes.YELLOW)} "
+                f"{colorize(existing['title'], AnsiCodes.WHITE)} is already "
+                "installed. Use 'update' instead."
+            )
+            continue
+
+        try:
+            remote = fetch_remote(spec, flavor.name)
+        except GitHubError as exc:
+            print(f"  {colorize('✗', AnsiCodes.RED)} {spec.slug}: {exc}")
+            continue
+
+        size_str = (
+            colorize(f"  {format_size(remote.asset_size)}", AnsiCodes.GRAY)
+            if remote.asset_size else ""
+        )
+        print(
+            f"  {colorize('✓', AnsiCodes.GREEN)} Found: "
+            f"{colorize(_remote_label(remote), AnsiCodes.WHITE)}  "
+            f"{colorize(remote.describe, AnsiCodes.GRAY)}"
+        )
+        if remote.flavor_mismatch:
+            log.warning(
+                "%s is built for a different game version than %s "
+                "(use --flavor to override).",
+                remote.asset_name, flavor.label,
+            )
+        print(f"  {colorize('↓', AnsiCodes.CYAN)} Downloading...{size_str}")
+
+        folders = install_remote(spec, remote, ".", label=spec.repo)
+        if folders is None:
+            continue
+
+        entry = make_source_entry(spec, remote, folders, existing)
+        sources[spec.key] = entry
+        changed = True
+
+        folders_str = colorize(f"[{', '.join(folders)}]", AnsiCodes.GRAY)
+        print(
+            f"  {colorize('✓', AnsiCodes.GREEN)} Installed "
+            f"{colorize(entry['title'], AnsiCodes.WHITE)}  {folders_str}"
+        )
+
+    if changed:
+        save_github_sources(sources)
+
+
+def _update_github(
+    sources: dict[str, dict[str, Any]],
+    requested: set[str],
+    flavor: DetectedFlavor,
+) -> tuple[int, int, int, int]:
+    """Check GitHub-installed addons against their repos and update them.
+
+    Args:
+        sources: Loaded source records (mutated and saved on change).
+        requested: Lower-case names to limit the update to; empty means all.
+        flavor: Detected game flavor (used to pick a release asset).
+
+    Returns:
+        ``(updated, skipped, failed, matched)`` counts.
+    """
+    live = _live_github_sources(sources)
+    changed = len(live) != len(sources)
+    for key in set(sources) - set(live):
+        log.debug("Dropping GitHub source %s — its folders are gone", key)
+        del sources[key]
+
+    targets = {
+        key: entry for key, entry in sources.items()
+        if not requested or requested & _github_match_names(key, entry)
+    }
+    updated = skipped = failed = 0
+    if targets:
+        total = len(targets)
+        print(
+            f"\n  {colorize('▸', AnsiCodes.CYAN)} Checking "
+            f"{colorize(str(total), AnsiCodes.WHITE + AnsiCodes.BOLD)} "
+            f"GitHub addon(s) for updates...\n"
+        )
+
+    for i, (key, entry) in enumerate(targets.items(), 1):
+        counter = colorize(f"[{i}/{len(targets)}]", AnsiCodes.GRAY)
+        name_str = colorize(truncate(entry["title"], 40), AnsiCodes.WHITE)
+        print(f"  {counter} {name_str}", end="", flush=True)
+
+        spec = entry_spec(entry)
+        local_ver = read_local_meta(entry["folders"]).get("Version", "")
+        try:
+            remote = fetch_remote(spec, flavor.name)
+        except GitHubError as exc:
+            print(
+                f"\r  {counter} {name_str}  "
+                f"{colorize('✗ ' + str(exc), AnsiCodes.RED)}          "
+            )
+            failed += 1
+            continue
+
+        new_label = _remote_label(remote)
+        if not is_outdated(entry, remote, local_ver):
+            print(
+                f"\r  {counter} {name_str}  "
+                f"{colorize('✓', AnsiCodes.GREEN)} "
+                f"{colorize('up to date', AnsiCodes.GRAY)}  "
+                f"{colorize(truncate(local_ver or new_label, 30), AnsiCodes.GRAY)}"
+                f"          "
+            )
+            skipped += 1
+            continue
+
+        size_str = (
+            colorize(f"({format_size(remote.asset_size)})", AnsiCodes.GRAY)
+            if remote.asset_size else ""
+        )
+        change = (
+            f"{truncate(local_ver, 20)} → {new_label}" if local_ver else new_label
+        )
+        print(
+            f"\r  {counter} {name_str}  "
+            f"{colorize('↑', AnsiCodes.CYAN)} "
+            f"{colorize(change, AnsiCodes.CYAN)}  {size_str}          "
+        )
+
+        folders = install_remote(spec, remote, ".", label=spec.repo)
+        if folders is None:
+            print(f"  {colorize('✗', AnsiCodes.RED)} Failed to download {entry['title']}.")
+            failed += 1
+            continue
+
+        for old in entry["folders"]:
+            if old not in folders and Path(old).is_dir():
+                log.debug("Removing stale folder: %s", old)
+                shutil.rmtree(old)
+
+        new_entry = make_source_entry(spec, remote, folders, entry)
+        sources[key] = new_entry
+        changed = True
+        print(
+            f"  {colorize('✓', AnsiCodes.GREEN)} {name_str}  "
+            f"{colorize('updated →', AnsiCodes.GREEN)} "
+            f"{colorize(new_label, AnsiCodes.WHITE)}"
+        )
+        updated += 1
+
+    if changed:
+        save_github_sources(sources)
+    return updated, skipped, failed, len(targets)
+
+
+def _print_update_summary(updated: int, skipped: int, failed: int) -> None:
+    u_str = colorize(str(updated), AnsiCodes.GREEN + AnsiCodes.BOLD if updated else AnsiCodes.GRAY)
+    s_str = colorize(str(skipped), AnsiCodes.GRAY)
+    f_str = colorize(str(failed), AnsiCodes.RED + AnsiCodes.BOLD if failed else AnsiCodes.GRAY)
+    print(
+        f"\n  {u_str} updated   "
+        f"{s_str} up to date   "
+        f"{f_str} failed\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -356,41 +600,56 @@ def _install_from_identifiers(
     args: argparse.Namespace,
     identifiers: list[str],
 ) -> None:
-    """Resolve and install each identifier (slug, name, or CurseForge ID)."""
-    key = get_api_key(args)
+    """Install each identifier: a GitHub repo, or a CurseForge slug/name/ID."""
+    github_specs: list[RepoSpec] = []
+    cf_identifiers: list[str] = []
+    for ident in identifiers:
+        spec = parse_github_spec(ident)
+        if spec:
+            github_specs.append(spec)
+        else:
+            cf_identifiers.append(ident)
+
+    key = get_api_key(args) if cf_identifiers else ""
     flavor = detect_flavor(getattr(args, "flavor", None))
 
     print()
     _print_game(flavor)
 
-    by_project, _ = scan_addons()
-    installed_pids: set[int] = set(by_project.keys())
-    cache = load_id_cache()
-    cache_changed = False
+    if github_specs:
+        _install_github(github_specs, flavor)
 
-    for ident in identifiers:
-        arrow = colorize("▸", AnsiCodes.CYAN)
-        ident_c = colorize(ident, AnsiCodes.WHITE)
-        print(f"\n  {arrow} Resolving {ident_c}...")
-        mod = resolve(key, ident, flavor.id)
-        if not mod:
-            print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {ident}")
-            continue
+    if cf_identifiers:
+        by_project, _ = scan_addons()
+        installed_pids: set[int] = set(by_project.keys())
+        cache = load_id_cache()
+        cache_changed = False
 
-        if _install_mod(mod, key, flavor, installed_pids, cache):
-            cache_changed = True
+        for ident in cf_identifiers:
+            arrow = colorize("▸", AnsiCodes.CYAN)
+            ident_c = colorize(ident, AnsiCodes.WHITE)
+            print(f"\n  {arrow} Resolving {ident_c}...")
+            mod = resolve(key, ident, flavor.id)
+            if not mod:
+                print(f"  {colorize('✗', AnsiCodes.RED)} Not found: {ident}")
+                continue
 
-    if cache_changed:
-        save_id_cache(cache)
+            if _install_mod(mod, key, flavor, installed_pids, cache):
+                cache_changed = True
+
+        if cache_changed:
+            save_id_cache(cache)
 
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
 
 
 def cmd_install(args: argparse.Namespace) -> None:
-    """Install one or more addons from CurseForge."""
+    """Install addons from CurseForge or GitHub."""
     identifiers = list(args.addons or [])
     if not identifiers:
-        log.error("Specify at least one addon (slug, name, or CurseForge ID).")
+        log.error(
+            "Specify at least one addon (CurseForge slug/name/ID or GitHub URL)."
+        )
         sys.exit(1)
     _install_from_identifiers(args, identifiers)
 
@@ -413,9 +672,13 @@ def cmd_import(args: argparse.Namespace) -> None:
 
 def cmd_update(args: argparse.Namespace) -> None:
     """Check for and apply updates to installed addons."""
-    key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
     flavor_id = flavor.id
+
+    github_sources = load_github_sources()
+    key = getattr(args, "key", None) or os.environ.get("CURSEFORGE_API_KEY", "")
+    if not key and not github_sources:
+        key = get_api_key(args)  # exits with setup instructions
 
     print()
     _print_game(flavor)
@@ -428,6 +691,24 @@ def cmd_update(args: argparse.Namespace) -> None:
         log.error("  ...\\World of Warcraft\\_retail_\\Interface\\AddOns\\")
         log.error("  ...\\World of Warcraft\\_classic_beta_\\Interface\\AddOns\\")
         sys.exit(1)
+
+    updated = skipped = failed = 0
+    gh_matched = 0
+    if github_sources:
+        requested_names = {a.lower() for a in args.addons or []}
+        updated, skipped, failed, gh_matched = _update_github(
+            github_sources, requested_names, flavor
+        )
+        _strip_tracked(by_project, unmatched, github_sources)
+
+    if not key:
+        if by_project or unmatched:
+            print(
+                f"\n  {colorize('–', AnsiCodes.GRAY)} No CurseForge API key set — "
+                "skipping non-GitHub addons. Run 'wowaddons init' to enable."
+            )
+        _print_update_summary(updated, skipped, failed)
+        return
 
     cache: dict[str, dict[str, Any]] = {}
     cache_changed = False
@@ -458,10 +739,13 @@ def cmd_update(args: argparse.Namespace) -> None:
             cache_changed = True
 
     if not by_project:
-        print(
-            f"  {colorize('–', AnsiCodes.GRAY)} No CurseForge addons detected. "
-            "Nothing to update."
-        )
+        if github_sources:
+            _print_update_summary(updated, skipped, failed)
+        else:
+            print(
+                f"  {colorize('–', AnsiCodes.GRAY)} No CurseForge addons detected. "
+                "Nothing to update."
+            )
         return
 
     targets = by_project
@@ -476,7 +760,10 @@ def cmd_update(args: argparse.Namespace) -> None:
             if folder_match or id_match:
                 targets[pid] = data
         if not targets:
-            log.warning("None of the specified addons were found locally.")
+            if gh_matched:
+                _print_update_summary(updated, skipped, failed)
+            else:
+                log.warning("None of the specified addons were found locally.")
             return
 
     total_count = len(targets)
@@ -485,9 +772,6 @@ def cmd_update(args: argparse.Namespace) -> None:
         f"{colorize(str(total_count), AnsiCodes.WHITE + AnsiCodes.BOLD)} addon(s) for updates...\n"
     )
 
-    updated = 0
-    skipped = 0
-    failed = 0
     stale_unmatched: list[UnmatchedAddon] = []
 
     for i, (pid, data) in enumerate(targets.items(), 1):
@@ -583,14 +867,7 @@ def cmd_update(args: argparse.Namespace) -> None:
     if cache_changed:
         save_id_cache(cache)
 
-    u_str = colorize(str(updated), AnsiCodes.GREEN + AnsiCodes.BOLD if updated else AnsiCodes.GRAY)
-    s_str = colorize(str(skipped), AnsiCodes.GRAY)
-    f_str = colorize(str(failed), AnsiCodes.RED + AnsiCodes.BOLD if failed else AnsiCodes.GRAY)
-    print(
-        f"\n  {u_str} updated   "
-        f"{s_str} up to date   "
-        f"{f_str} failed\n"
-    )
+    _print_update_summary(updated, skipped, failed)
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
@@ -602,9 +879,38 @@ def cmd_remove(args: argparse.Namespace) -> None:
         for folder in data["folders"]:
             folder_to_pid[folder.lower()] = pid
 
+    github_sources = load_github_sources()
+    github_changed = False
+
     print()
     for target in args.addons:
         target_lower = target.lower()
+
+        spec = parse_github_spec(target)
+        gh_names = {target_lower} | ({spec.key} if spec else set())
+        gh_key = next(
+            (
+                k for k, e in github_sources.items()
+                if gh_names & _github_match_names(k, e)
+            ),
+            None,
+        )
+        if gh_key is not None:
+            entry = github_sources.pop(gh_key)
+            github_changed = True
+            for folder in entry["folders"]:
+                path = Path(folder)
+                if path.is_dir():
+                    shutil.rmtree(path)
+                    print(
+                        f"  {colorize('✓', AnsiCodes.GREEN)} Removed "
+                        f"{colorize(folder + '/', AnsiCodes.WHITE)}"
+                    )
+            print(
+                f"  {colorize('✓', AnsiCodes.GREEN)} Uninstalled "
+                f"{colorize(entry['title'], AnsiCodes.WHITE)}"
+            )
+            continue
 
         matched_pid: int | None = None
         if target.isdigit():
@@ -644,6 +950,9 @@ def cmd_remove(args: argparse.Namespace) -> None:
             f"{colorize(data['title'], AnsiCodes.WHITE)}"
         )
 
+    if github_changed:
+        save_github_sources(github_sources)
+
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
 
 
@@ -660,6 +969,9 @@ def cmd_list(args: argparse.Namespace) -> None:
             "Make sure you're in your WoW AddOns folder."
         )
         return
+
+    github_sources = _live_github_sources(load_github_sources())
+    _strip_tracked(by_project, unmatched, github_sources)
 
     key = os.environ.get("CURSEFORGE_API_KEY", "") or getattr(
         args, "key", None
@@ -699,6 +1011,33 @@ def cmd_list(args: argparse.Namespace) -> None:
                 f" {colorize(folders, AnsiCodes.GRAY)}"
             )
 
+    if github_sources:
+        header = colorize(
+            f"  GitHub addons ({len(github_sources)})",
+            AnsiCodes.CYAN + AnsiCodes.BOLD,
+        )
+        print(f"\n{header}")
+        col_title = colorize(f"  {'Title':<36}", AnsiCodes.GRAY)
+        col_ver = colorize(f"{'Version':<24}", AnsiCodes.GRAY)
+        col_repo = colorize("Repository", AnsiCodes.GRAY)
+        print(f"{col_title} {col_ver} {col_repo}")
+        print(colorize("  " + "─" * 88, AnsiCodes.GRAY))
+        for _key, entry in sorted(
+            github_sources.items(), key=lambda x: x[1]["title"].lower()
+        ):
+            title = truncate(entry["title"], 34)
+            ver = truncate(
+                read_local_meta(entry["folders"]).get("Version") or "?", 22
+            )
+            slug = f"{entry['owner']}/{entry['repo']}"
+            if entry.get("ref"):
+                slug += f"@{entry['ref']}"
+            print(
+                f"  {colorize(f'{title:<36}', AnsiCodes.WHITE)}"
+                f" {colorize(f'{ver:<24}', AnsiCodes.GRAY)}"
+                f" {colorize(slug, AnsiCodes.GRAY)}"
+            )
+
     if unmatched:
         header = colorize(
             f"  Custom/untracked addons ({len(unmatched)})",
@@ -720,7 +1059,7 @@ def cmd_list(args: argparse.Namespace) -> None:
                 f" {colorize(title, AnsiCodes.GRAY)}"
             )
 
-    total = len(by_project) + len(unmatched)
+    total = len(by_project) + len(unmatched) + len(github_sources)
     print(f"\n  {colorize(str(total), AnsiCodes.WHITE + AnsiCodes.BOLD)} addon(s) detected.\n")
 
 
@@ -806,10 +1145,59 @@ def cmd_search(args: argparse.Namespace) -> None:
     print(f"\n  {colorize('Done.', AnsiCodes.GREEN + AnsiCodes.BOLD)}\n")
 
 
+def _info_github(spec: RepoSpec, flavor: DetectedFlavor) -> None:
+    """Print details for a GitHub-hosted addon."""
+    print(
+        f"  {colorize('▸', AnsiCodes.CYAN)} Looking up "
+        f"{colorize(spec.slug, AnsiCodes.WHITE)} on GitHub..."
+    )
+    try:
+        summary = fetch_repo_summary(spec)
+        remote = fetch_remote(spec, flavor.name)
+    except GitHubError as exc:
+        print(f"  {colorize('✗', AnsiCodes.RED)} {spec.slug}: {exc}")
+        return
+
+    entry = load_github_sources().get(spec.key)
+    if entry and not any(Path(f).is_dir() for f in entry["folders"]):
+        entry = None
+
+    def row(label: str, value: str) -> None:
+        print(f"  {colorize(label + ':', AnsiCodes.GRAY):<28} {value}")
+
+    print()
+    row("Repository", colorize(summary.get("full_name", spec.slug), AnsiCodes.WHITE + AnsiCodes.BOLD))
+    row("Summary", truncate(summary.get("description") or "N/A", 65))
+    row("Stars", colorize(format_count(summary.get("stargazers_count", 0)), AnsiCodes.WHITE))
+    row("Default branch", colorize(summary.get("default_branch", "?"), AnsiCodes.CYAN))
+    row("Latest", colorize(f"{_remote_label(remote)} ({remote.describe})", AnsiCodes.WHITE))
+    row("URL", colorize(summary.get("html_url", spec.url), AnsiCodes.CYAN))
+    if entry:
+        local_ver = read_local_meta(entry["folders"]).get("Version", "?")
+        state = (
+            colorize("update available", AnsiCodes.YELLOW)
+            if is_outdated(entry, remote, local_ver if local_ver != "?" else "")
+            else colorize("up to date", AnsiCodes.GREEN)
+        )
+        row("Installed", f"{colorize(local_ver, AnsiCodes.GREEN)}  {state}")
+        row("Folders", colorize(", ".join(entry["folders"]), AnsiCodes.GRAY))
+    else:
+        row("Installed", colorize("no", AnsiCodes.GRAY))
+    print()
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     """Display detailed information about a specific addon."""
-    key = get_api_key(args)
     flavor = detect_flavor(getattr(args, "flavor", None))
+
+    github_spec = parse_github_spec(args.addon)
+    if github_spec:
+        print()
+        _print_game(flavor)
+        _info_github(github_spec, flavor)
+        return
+
+    key = get_api_key(args)
 
     lu = colorize("▸", AnsiCodes.CYAN)
     addon_c = colorize(args.addon, AnsiCodes.WHITE)
@@ -855,6 +1243,8 @@ def cmd_export(args: argparse.Namespace) -> None:
     from .snapshot import EXPORT_FORMAT_LINE
 
     by_project, unmatched = scan_addons()
+    github_sources = _live_github_sources(load_github_sources())
+    _strip_tracked(by_project, unmatched, github_sources)
     cache = load_id_cache()
 
     exported: dict[int, str] = {}
@@ -869,27 +1259,35 @@ def cmd_export(args: argparse.Namespace) -> None:
         if pid not in exported:
             exported[pid] = entry.get("name", u["title"])
 
+    github_entries = sorted(
+        github_sources.values(), key=lambda e: e["title"].lower()
+    )
+
     lines = [
         EXPORT_FORMAT_LINE,
         "# Share this file; recipients run: wowaddons import <path>",
-        "# Each data line is a CurseForge project ID (# title is optional).",
+        "# Each data line is a CurseForge project ID or a GitHub URL "
+        "(# title is optional).",
         "",
     ]
-    if not exported:
+    if not exported and not github_entries:
         lines.append(
-            "# No CurseForge-backed addons found "
-            "(X-Curse-Project-ID in .toc, or matched folders in your ID cache)."
+            "# No CurseForge or GitHub addons found "
+            "(X-Curse-Project-ID in .toc, matched folders in your ID cache, "
+            "or addons installed from GitHub)."
         )
         lines.append("")
 
     for pid in sorted(exported.keys(), key=lambda p: exported[p].lower()):
         lines.append(f"{pid}  # {exported[pid]}")
+    for entry in github_entries:
+        lines.append(f"{entry_spec(entry).url}  # {entry['title']}")
 
     text = "\n".join(lines) + "\n"
     dest = getattr(args, "outfile", None)
     if dest:
         Path(dest).write_text(text, encoding="utf-8")
-        n = len(exported)
+        n = len(exported) + len(github_entries)
         msg = f"  ✓ Wrote {n} project(s) to {dest}"
         print(colorize(msg, AnsiCodes.GREEN))
         print()

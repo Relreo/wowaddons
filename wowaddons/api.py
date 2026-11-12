@@ -289,6 +289,77 @@ def match_folder(
 # ---------------------------------------------------------------------------
 
 
+def download_file(url: str, dest_path: str, label: str = "") -> bool:
+    """Stream *url* to *dest_path* with a live progress bar.
+
+    Returns:
+        ``True`` on success, ``False`` (after logging an error) on failure.
+    """
+    log.debug("Downloading: %s", url)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"wowaddons/{__version__}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            downloaded = 0
+            chunk_size = 65536
+
+            with open(dest_path, "wb") as fp:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    fp.write(chunk)
+                    downloaded += len(chunk)
+                    print_dl_progress(label or "addon", downloaded, total)
+
+        clear_line()
+        log.debug("Downloaded %s", format_size(os.path.getsize(dest_path)))
+        return True
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        clear_line()
+        log.error("Download failed: %s", exc)
+        return False
+
+
+def safe_extract(zip_path: str, extract_dir: str) -> list[str] | None:
+    """Validate and extract a zip archive, guarding against zip-slip.
+
+    Returns:
+        The sorted top-level entry names, or ``None`` (after logging an
+        error) if the archive is invalid or unsafe.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            entries = zf.namelist()
+            log.debug("Zip contains %s entries", len(entries))
+
+            extract_root = Path(extract_dir).resolve()
+            for member in entries:
+                target = (extract_root / member).resolve()
+                if not str(target).startswith(str(extract_root)):
+                    log.error("Zip contains path traversal entry: %s", member)
+                    return None
+
+            folders = sorted(
+                {n.split("/")[0] for n in entries if n.split("/")[0]}
+            )
+            if not folders:
+                log.error("Zip archive is empty.")
+                return None
+            for folder in folders:
+                if folder in (".", "..") or os.sep in folder:
+                    log.error("Zip contains unsafe folder name: %s", folder)
+                    return None
+            log.debug("Top-level folders: %s", folders)
+            zf.extractall(extract_dir)
+            return folders
+    except zipfile.BadZipFile:
+        log.error("Downloaded file is not a valid zip archive.")
+        return None
+
+
 def download_extract(
     url: str,
     dest: str,
@@ -308,70 +379,16 @@ def download_extract(
     """
     staging = tempfile.mkdtemp(prefix="wowaddons_")
     log.debug("Created staging directory: %s", staging)
-    folders: list[str] = []
     try:
         zip_path = os.path.join(staging, "addon.zip")
-
-        log.debug("Downloading: %s", url)
-        req = urllib.request.Request(
-            url, headers={"User-Agent": f"wowaddons/{__version__}"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                total = int(resp.headers.get("Content-Length") or 0)
-                downloaded = 0
-                chunk_size = 65536
-
-                with open(zip_path, "wb") as fp:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        fp.write(chunk)
-                        downloaded += len(chunk)
-                        print_dl_progress(label or "addon", downloaded, total)
-
-            clear_line()
-            zip_size = os.path.getsize(zip_path)
-            log.debug("Downloaded %s", format_size(zip_size))
-        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-            clear_line()
-            log.error("Download failed: %s", exc)
+        if not download_file(url, zip_path, label):
             return None
 
         extract_dir = os.path.join(staging, "extract")
         os.makedirs(extract_dir)
 
-        try:
-            with zipfile.ZipFile(zip_path) as zf:
-                entries = zf.namelist()
-                log.debug("Zip contains %s entries", len(entries))
-
-                extract_root = Path(extract_dir).resolve()
-                for member in entries:
-                    target = (extract_root / member).resolve()
-                    if not str(target).startswith(str(extract_root)):
-                        log.error(
-                            "Zip contains path traversal entry: %s", member
-                        )
-                        return None
-
-                folders = sorted(
-                    {n.split("/")[0] for n in entries if n.split("/")[0]}
-                )
-                if not folders:
-                    log.error("Zip archive is empty.")
-                    return None
-                for folder in folders:
-                    if folder in (".", "..") or os.sep in folder:
-                        log.error(
-                            "Zip contains unsafe folder name: %s", folder
-                        )
-                        return None
-                log.debug("Top-level folders: %s", folders)
-                zf.extractall(extract_dir)
-        except zipfile.BadZipFile:
-            log.error("Downloaded file is not a valid zip archive.")
+        folders = safe_extract(zip_path, extract_dir)
+        if folders is None:
             return None
 
         for folder in folders:

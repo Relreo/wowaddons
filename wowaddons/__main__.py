@@ -15,10 +15,11 @@ def main() -> None:
     """Parse arguments and dispatch to the appropriate command handler."""
     parser = argparse.ArgumentParser(
         prog="wowaddons",
-        description="Lightweight WoW Addon Package Manager (CurseForge)",
+        description="Lightweight WoW Addon Package Manager (CurseForge + GitHub)",
         epilog=(
             "Run from your WoW AddOns folder. "
-            "Set CURSEFORGE_API_KEY env var or pass --key."
+            "Set CURSEFORGE_API_KEY env var or pass --key "
+            "(not needed for GitHub-only addons)."
         ),
     )
     parser.add_argument(
@@ -53,10 +54,13 @@ def main() -> None:
 
     sub.add_parser("init", help="Set up your CurseForge API key")
 
-    p = sub.add_parser("install", help="Install addon(s)")
+    p = sub.add_parser("install", help="Install addon(s) from CurseForge or GitHub")
     p.add_argument(
         "addons", nargs="+",
-        help="Addon slug(s), name(s), or CurseForge ID(s)",
+        help=(
+            "Addon slug(s), name(s), or CurseForge ID(s), or GitHub "
+            "repo(s): URL, clone URL (.git), or owner/repo"
+        ),
     )
 
     p = sub.add_parser(
@@ -87,7 +91,9 @@ def main() -> None:
     p.add_argument("query", nargs="+", help="Search terms")
 
     p = sub.add_parser("info", help="Show details for an addon")
-    p.add_argument("addon", help="Addon slug, name, or CurseForge ID")
+    p.add_argument(
+        "addon", help="Addon slug, name, CurseForge ID, or GitHub URL/owner/repo"
+    )
 
     p = sub.add_parser(
         "export",
