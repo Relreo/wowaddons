@@ -28,20 +28,44 @@ class DetectedFlavor:
     source: str
 
 
+def parse_toc_text(text: str) -> dict[str, str]:
+    """Parse the text of a WoW ``.toc`` file and return its ``##`` fields."""
+    meta: dict[str, str] = {}
+    for line in text.lstrip("\ufeff").splitlines():
+        line = line.strip()
+        if line.startswith("##"):
+            key, _, value = line[2:].partition(":")
+            if value:
+                meta[key.strip()] = value.strip()
+    return meta
+
+
 def parse_toc(toc_path: Path | str) -> dict[str, str]:
     """Parse a WoW ``.toc`` file and return its ``##`` metadata fields."""
-    meta: dict[str, str] = {}
     try:
         with open(toc_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("## "):
-                    key, _, value = line[3:].partition(":")
-                    if value:
-                        meta[key.strip()] = value.strip()
+            return parse_toc_text(f.read())
     except OSError:
-        pass
-    return meta
+        return {}
+
+
+def find_toc(folder: Path) -> Path | None:
+    """Return the primary ``.toc`` in an addon folder (``<folder>.toc`` first)."""
+    toc_files = list(folder.glob("*.toc"))
+    if not toc_files:
+        return None
+    return next((t for t in toc_files if t.stem == folder.name), toc_files[0])
+
+
+def read_local_meta(folders: list[str]) -> dict[str, str]:
+    """Return ``.toc`` metadata from the first of *folders* that has one."""
+    for name in folders:
+        toc = find_toc(Path(name))
+        if toc:
+            meta = parse_toc(toc)
+            if meta:
+                return meta
+    return {}
 
 
 def scan_addons() -> tuple[dict[int, ProjectData], list[UnmatchedAddon]]:
@@ -65,13 +89,10 @@ def scan_addons() -> tuple[dict[int, ProjectData], list[UnmatchedAddon]]:
         if entry.name.startswith(("Blizzard_", ".")):
             continue
 
-        toc_files = list(entry.glob("*.toc"))
-        if not toc_files:
+        toc = find_toc(entry)
+        if toc is None:
             continue
 
-        toc = next(
-            (t for t in toc_files if t.stem == entry.name), toc_files[0]
-        )
         meta = parse_toc(toc)
         title = strip_wow_colors(meta.get("Title", entry.name))
         version = meta.get("Version", "")

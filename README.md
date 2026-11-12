@@ -1,7 +1,7 @@
 # wowaddons
 
-A lightweight Python CLI for managing World of Warcraft addons via CurseForge.
-No third-party dependencies — just Python 3.8+.
+A lightweight Python CLI for managing World of Warcraft addons via CurseForge
+and GitHub. No third-party dependencies — just Python 3.8+.
 
 ## First-time setup
 
@@ -57,9 +57,9 @@ before searching.
 | Command | Description |
 |---------|-------------|
 | `init` | Save your CurseForge API key (one-time setup) |
-| `install <slug ...>` | Install one or more addons by slug, name, or CurseForge project ID |
-| `import <file>` | Install every project ID listed in an `export` snapshot file |
-| `export` | Print a snapshot to stdout (CurseForge-backed addons only) |
+| `install <slug ...>` | Install one or more addons by slug, name, or CurseForge project ID, **or from a GitHub repo** (URL, clone URL, or `owner/repo`) |
+| `import <file>` | Install every project ID / GitHub URL listed in an `export` snapshot file |
+| `export` | Print a snapshot to stdout (CurseForge- and GitHub-backed addons) |
 | `export <file>` | Write that snapshot to a file |
 | `update` | Check all installed addons for updates and download what's new |
 | `update <name ...>` | Update specific addon(s) by folder name or project ID |
@@ -67,7 +67,7 @@ before searching.
 | `uninstall <name ...>` | Alias for `remove` |
 | `list` | List all detected addons with versions and folder names |
 | `search <query>` | Search CurseForge and optionally install a result interactively |
-| `info <slug>` | Show details for an addon (authors, downloads, install status, URL) |
+| `info <slug or repo>` | Show details for an addon (authors, downloads, install status, URL); works for GitHub repos too |
 
 ### Flags
 
@@ -78,6 +78,51 @@ before searching.
 | `--key KEY` | Pass API key directly instead of using the env var |
 | `--flavor FLAVOR` | Override auto-detected game flavor (`retail`, `classic`, `classic_era`, `forever`, `tbc`, `wrath`, `cata`) |
 | `-V`, `--version` | Print the version and exit |
+
+## Installing addons from GitHub
+
+Anything you can copy from a repo's page works — the browser URL, the
+**Code** menu's HTTPS/SSH clone URL, or just `owner/repo`:
+
+```
+wowaddons install https://github.com/CHogan0973/BookOfDogs
+wowaddons install https://github.com/oliome/FriendlyNameplateGuild.git
+wowaddons install CHogan0973/BookOfDogs git@github.com:oliome/FriendlyNameplateGuild.git
+wowaddons install https://github.com/someone/addon/tree/dev   # pin a branch
+```
+
+GitHub addons need **no CurseForge API key**. CurseForge and GitHub
+identifiers can be mixed in one `install`.
+
+**What gets installed**
+
+1. If the repo has a GitHub **release** with a `.zip` (what the
+   [BigWigs packager](https://github.com/BigWigsMods/packager) produces), the
+   newest release is used — stable over pre-release, and the zip matching your
+   game flavor when there are several (e.g. `-forever`, `-retail`).
+2. Otherwise the repo itself is the addon: its source is downloaded, the
+   folder is named from `.pkgmeta` `package-as` (or the `.toc` name), and
+   dotfiles plus `.pkgmeta` `ignore:` entries are left out. If the repo
+   instead holds addon folders (each with a `.toc`), those are installed as-is.
+3. A `/tree/<branch>` URL always uses that branch's source.
+
+**How updates work** — `wowaddons update` checks each GitHub addon against
+its repo:
+
+- **Release-based:** compares the latest release tag with your `.toc`
+  `## Version` (and the tag recorded at install).
+- **Branch-based:** compares the repo's `.toc` `## Version` with yours. If the
+  repo's `.toc` only has a packager placeholder like `@project-version@`, it
+  compares the repo's git tree SHA recorded at install time instead.
+
+If the version differs, the addon is re-downloaded and replaced. `update
+<folder or owner/repo>` limits it to specific addons, and `remove` / `list` /
+`export` handle GitHub addons too. Install records live in
+`%LOCALAPPDATA%\wowaddons\github\` (one file per AddOns folder).
+
+GitHub's unauthenticated API allows 60 requests/hour (each addon check uses
+1–2). Set a `GITHUB_TOKEN` environment variable for a higher limit. Private
+repos are not supported.
 
 ## Export and import (sharing)
 
@@ -129,4 +174,6 @@ You can also pipe or redirect: `wowaddons export > my-addons.txt`.
 ## Privacy
 
 Only sends your API key (as the `x-api-key` header) and `wowaddons/<version>`
-as the User-Agent. No local paths, system info, or telemetry are transmitted.
+as the User-Agent. GitHub requests send only the User-Agent (plus
+`GITHUB_TOKEN` if you set one, to `api.github.com` only). No local paths,
+system info, or telemetry are transmitted.

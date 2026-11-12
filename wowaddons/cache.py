@@ -79,6 +79,45 @@ def save_id_cache(
         log.debug("Could not write ID cache: %s", exc)
 
 
+def github_sources_path(addons_root: Path | None = None) -> Path:
+    """JSON file path tracking GitHub-installed addons for an AddOns directory."""
+    root = _addons_root(addons_root)
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+    return _user_data_dir() / "github" / f"{digest}.json"
+
+
+def load_github_sources(
+    addons_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load GitHub-installed addon records (``owner/repo`` → entry)."""
+    path = github_sources_path(addons_root)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("version") == 1:
+            entries = data.get("entries", {})
+            if isinstance(entries, dict):
+                return entries
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_github_sources(
+    sources: dict[str, dict[str, Any]],
+    addons_root: Path | None = None,
+) -> None:
+    """Persist GitHub-installed addon records for an AddOns directory."""
+    path = github_sources_path(addons_root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "entries": sources}, f, indent=2)
+        log.debug("Saved %s GitHub source(s) to %s", len(sources), path)
+    except OSError as exc:
+        log.warning("Could not save GitHub sources (%s): %s", path, exc)
+
+
 def apply_id_cache(
     cache: dict[str, dict[str, Any]],
     by_project: dict[int, ProjectData],
