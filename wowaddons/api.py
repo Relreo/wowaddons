@@ -115,11 +115,6 @@ def search_addons(
         params["gameVersionTypeId"] = flavor_id
     resp = cf_get("/v1/mods/search", key, params)
     data = resp.get("data", []) if resp else []
-    if not data and flavor_id:
-        log.debug("No results with flavor filter, retrying without it")
-        params.pop("gameVersionTypeId")
-        resp = cf_get("/v1/mods/search", key, params)
-        data = resp.get("data", []) if resp else []
     log.debug("Search returned %s result(s)", len(data))
     return data
 
@@ -143,13 +138,18 @@ def get_files(
         params["gameVersionTypeId"] = flavor_id
     resp = cf_get(f"/v1/mods/{mod_id}/files", key, params)
     data = resp.get("data", []) if resp else []
-    if not data and flavor_id:
-        log.debug("No files with flavor filter, retrying without it")
-        params.pop("gameVersionTypeId")
-        resp = cf_get(f"/v1/mods/{mod_id}/files", key, params)
-        data = resp.get("data", []) if resp else []
+    if flavor_id and data:
+        data = [f for f in data if _file_matches_flavor(f, flavor_id)]
     log.debug("Found %s file(s)", len(data))
     return data
+
+
+def _file_matches_flavor(file_entry: dict[str, Any], flavor_id: int) -> bool:
+    """True if the file is tagged for *flavor_id*, or has no type metadata."""
+    versions = file_entry.get("sortableGameVersions") or []
+    if not versions:
+        return True
+    return any(sv.get("gameVersionTypeId") == flavor_id for sv in versions)
 
 
 def pick_file(files: list[dict[str, Any]]) -> dict[str, Any] | None:

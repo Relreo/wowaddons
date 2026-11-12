@@ -13,7 +13,8 @@ No third-party dependencies — just Python 3.8+.
    (or use `wowaddons --key YOUR_KEY ...` for a single command).
 
 For addon commands, `cd` into the right **Interface\AddOns** folder first
-(retail, Classic, etc.).
+(retail, Classic, WoW Forever, etc.). The game flavor is taken from that
+path so search/install/update pull the matching CurseForge files.
 
 ## Installation
 
@@ -38,11 +39,18 @@ pip uninstall wowaddons
 
 ## Usage
 
-Example (retail):
+Examples:
 
 ```
 cd "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns"
+cd "C:\Program Files (x86)\World of Warcraft\_classic_\Interface\AddOns"
+cd "C:\Program Files (x86)\World of Warcraft\_classic_era_\Interface\AddOns"
+cd "C:\Program Files (x86)\World of Warcraft\_classic_beta_\Interface\AddOns"
 ```
+
+`_classic_beta_` is the WoW Forever beta client. Commands print the detected
+game (e.g. `Game: WoW Forever (from _classic_beta_)`) so you can confirm it
+before searching.
 
 ### Commands
 
@@ -68,7 +76,7 @@ cd "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns"
 | `-v`, `--verbose` | Show debug output (API calls, temp paths, version comparisons) |
 | `-q`, `--quiet` | Suppress everything except warnings and errors |
 | `--key KEY` | Pass API key directly instead of using the env var |
-| `--flavor FLAVOR` | Override auto-detected game flavor (`retail`, `classic`, `classic_era`) |
+| `--flavor FLAVOR` | Override auto-detected game flavor (`retail`, `classic`, `classic_era`, `forever`, `tbc`, `wrath`, `cata`) |
 | `-V`, `--version` | Print the version and exit |
 
 ## Export and import (sharing)
@@ -106,8 +114,13 @@ You can also pipe or redirect: `wowaddons export > my-addons.txt`.
   in that cache; `update` and `list` can extend it when matching unknown folders.
 - Sub-packages (e.g. `BigWigs_Core` under `BigWigs`) are automatically grouped
   under their parent project without any API calls
-- Game flavor is auto-detected from the directory path (`_retail_`, `_classic_`,
-  `_classic_era_`); override with `--flavor` if needed
+- Game flavor is auto-detected from the client's own install files: the
+  product code in the client folder's `.flavor.info`, and that product's
+  version in `World of Warcraft\.build.info` (e.g. `1.60.x` → WoW Forever,
+  `5.5.x` → MoP Classic). If those are missing it falls back to the install
+  folder name (`_retail_`, `_classic_beta_`, ...). Override with `--flavor`
+  if needed. Search and downloads stay on that flavor and do not fall back to
+  retail files.
 - Updates compare the local `.toc` version against the latest CurseForge file
   name, then fall back to file modification time if versions don't match cleanly
 - Downloads go to a temp directory first, the zip is validated (zip-slip

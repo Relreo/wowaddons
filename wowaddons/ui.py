@@ -50,6 +50,13 @@ def colorize(text: str, *codes: str) -> str:
     return "".join(codes) + text + AnsiCodes.RST
 
 
+def hyperlink(text: str, url: str) -> str:
+    """Make *text* a clickable OSC 8 terminal link to *url* when ANSI is on."""
+    if not _ansi_state[0]:
+        return text
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
 def render_bar(done: int, total: int, width: int = 34) -> str:
     """Render a progress bar string."""
     frac = min(done / total, 1.0) if total > 0 else 0.0
